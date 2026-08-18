@@ -42,7 +42,16 @@ export function baseCommandLabel(baseCommand: string): string {
 /**
  * Shorten a command for a BUTTON LABEL only — never for the pattern itself.
  * Truncating a pattern would change the grant; this is display only.
+ *
+ * The budget is generous because this label is the ONLY place the user sees what
+ * they are about to trust, and a short one collides: commands that share a long
+ * prefix — `gh api repos/<owner>/<repo>/contents/config.json` and the same call
+ * for `secrets.json` — truncate to the same string, so the menu offers to trust
+ * one of two commands the reader cannot tell apart. The dropdown clamps the
+ * rendered width with CSS anyway, and callers pass the untruncated command as a
+ * `title` tooltip, so a long command stays fully recoverable without widening
+ * the menu.
  */
-export function truncateCommandLabel(cmd: string, max = 30): string {
+export function truncateCommandLabel(cmd: string, max = 64): string {
   return cmd.length > max ? cmd.slice(0, max) + '…' : cmd
 }

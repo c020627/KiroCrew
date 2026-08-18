@@ -56,13 +56,25 @@ describe('truncateCommandLabel — label only, never the pattern', () => {
   })
 
   it('leaves a command of exactly the max length untouched', () => {
-    const exactly30 = 'a'.repeat(30)
-    expect(truncateCommandLabel(exactly30)).toBe(exactly30)
+    const exactly64 = 'a'.repeat(64)
+    expect(truncateCommandLabel(exactly64)).toBe(exactly64)
   })
 
   it('truncates one character past the max and marks it with an ellipsis', () => {
-    const long = 'a'.repeat(31)
-    expect(truncateCommandLabel(long)).toBe('a'.repeat(30) + '…')
+    const long = 'a'.repeat(65)
+    expect(truncateCommandLabel(long)).toBe('a'.repeat(64) + '…')
+  })
+
+  it('does not collide two commands that share a long prefix', () => {
+    // The label is the only thing the user reads before granting an exact-string
+    // match, so two different commands must not render as the same string. These
+    // two differ only in the filename, well past a short budget.
+    const config = 'gh api repos/owner/some-repository/contents/config.json --jq .sha'
+    const secrets = 'gh api repos/owner/some-repository/contents/secrets.json --jq .sha'
+    expect(truncateCommandLabel(config)).not.toBe(truncateCommandLabel(secrets))
+    // ...and pin that the OLD budget is what made them collide, so this test
+    // fails if the budget is narrowed back.
+    expect(truncateCommandLabel(config, 30)).toBe(truncateCommandLabel(secrets, 30))
   })
 
   it('honours a custom max', () => {
@@ -72,7 +84,7 @@ describe('truncateCommandLabel — label only, never the pattern', () => {
   it('shortens for display without altering what would be granted', () => {
     // The caller passes the untruncated command as the trust_command pattern;
     // this helper only feeds the button label.
-    const long = 'find /very/long/path -name "*.tsx" -exec grep -l something'
+    const long = 'find /very/long/path -name "*.tsx" -exec grep -l something-quite-long {} +'
     const label = truncateCommandLabel(long)
     expect(label).not.toBe(long)
     expect(label.endsWith('…')).toBe(true)

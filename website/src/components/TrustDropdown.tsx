@@ -41,7 +41,10 @@ export default function TrustDropdown({ fullCommand, baseCommand, isShell, disab
           onSelect={() => onAction('trust_command', fullCommand)}
         >
           <Shield size={12} className="shrink-0 text-accent" />
-          <span className="truncate">
+          {/* The untruncated command as a tooltip: the label is width-clamped, and
+              this grant is an exact-string match, so the user must be able to read
+              the whole thing before agreeing to it. */}
+          <span className="truncate" title={fullCommand}>
             <Trans
               i18nKey="components.trustDropdown.trust_this_command"
               values={{ cmd: truncated }}
