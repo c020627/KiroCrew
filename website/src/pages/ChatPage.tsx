@@ -103,6 +103,7 @@ import FollowUpCard from '../components/FollowUpCard'
 import FolderSuggestionCard from './chat/FolderSuggestionCard'
 import { useMoveSlotToFolder } from '../hooks/useMoveSlotToFolder'
 import PendingQuestionCard from '../components/PendingQuestionCard'
+import SessionPulseSurveyCard from '../components/SessionPulseSurveyCard'
 import type { FollowupItem } from '../store/chatSlice'
 
 // Stable identity for the "no follow-up cards" case: returning a fresh {} from
@@ -838,6 +839,16 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const messages = useAppSelector(s => s.chat.messages)
   const messagesRef = useRef(messages)
   messagesRef.current = messages
+  const kiroCrewVersion = useAppSelector(s => s.dashboard.status?.version) || ''
+  const assistantTurnCount = useMemo(
+    () =>
+      messages.filter(
+        m =>
+          m.role === 'assistant' &&
+          (m.kind ?? (m.meta?.kind as string | undefined)) !== 'compaction',
+      ).length,
+    [messages],
+  )
   const knowledgeFetch = useKnowledgeFetch(activeSlot)
   const knowledgeFetchRef = useRef(knowledgeFetch)
   knowledgeFetchRef.current = knowledgeFetch
@@ -3013,6 +3024,29 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     })
     return () => cancelAnimationFrame(raf)
   }, [activeTip, scrollBottom])
+
+  // Same re-anchor need as the tip above, for the session pulse survey card:
+  // it renders after ChatFooter, outside the virtualizer's measured rows, so
+  // any change to its rendered height — mounting/unmounting, or (since the
+  // card is a collapsed-by-default disclosure) expanding/collapsing and the
+  // post-submit collapse to its thank-you row — changes the scroll
+  // viewport's real content height without the virtualizer knowing.
+  // Otherwise a new turn arriving while the card is showing renders visually
+  // behind/under it instead of pushing it out of view. A counter rather than
+  // a boolean: the card can report the same "still visible" state across
+  // several distinct height changes, and the effect below only cares that
+  // SOMETHING changed, not what value it changed to.
+  const [surveyLayoutTick, setSurveyLayoutTick] = useState(0)
+  const handleSurveyLayoutChange = useCallback(() => setSurveyLayoutTick((t) => t + 1), [])
+  useEffect(() => {
+    if (!isAtBottomRef.current) return
+    const raf = requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (isAtBottomRef.current) scrollBottom(true)
+      })
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [surveyLayoutTick, scrollBottom])
 
   // Navigate to a (possibly off-window) display index: mount it first via the
   // virtualizer so the DOM-based scroll can find it, then scroll next frame.
@@ -6665,6 +6699,32 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               <div ref={virt.bottomSentinelRef} aria-hidden style={{ height: 1 }} />
               {/* Footer */}
               <ChatFooter running={slotRunning} stopping={slotStopping} state={slotState} lastRole={lastRole} streamTick={streamTick} regenerating={regenerating} stopState={currentSlot?.stop_state} />
+              {activeSlot && !slotLoading && (
+                <div className="px-4 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+                  <SessionPulseSurveyCard
+                    // Remount on session switch: without this, React reuses
+                    // the same component instance across sessions, so an
+                    // in-progress rating/feedback/email from session A would
+                    // still be sitting in state when the user switches to
+                    // session B and hits Submit — attributing A's answers to
+                    // B's sessionId prop, which had already updated.
+                    //
+                    // Gated on !slotLoading: the card captures its baseline
+                    // turn count on FIRST MOUNT (see the component's own
+                    // comment), so mounting before history finishes loading
+                    // would baseline at 0 and then count every loaded
+                    // historical turn as "live" once the fetch resolves —
+                    // reintroducing the exact reopened-session bug the
+                    // baseline exists to prevent, just via a race instead of
+                    // a missing check.
+                    key={activeSlot}
+                    sessionId={activeSlot}
+                    kiroCrewVersion={kiroCrewVersion}
+                    turnCount={assistantTurnCount}
+                    onLayoutChange={handleSurveyLayoutChange}
+                  />
+                </div>
+              )}
               <div style={{height: '2vh'}} />
             </div>
             )}
