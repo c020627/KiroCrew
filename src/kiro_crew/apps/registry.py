@@ -893,26 +893,74 @@ def _official_entry(entry: dict[str, Any]) -> bool:
     return not entry.get("_registry")
 
 
+def _rename_and_refresh_mtime(dest: Path, aside: Path) -> None:
+    """Rename *dest* to *aside* and refresh its mtime in one thread call.
+
+    Combining both syscalls into a single ``asyncio.to_thread`` invocation
+    closes the window a separate rename-then-utime pair left open: cancelling
+    the awaiting task between the two calls used to leave *aside* holding the
+    checkout's original mtime, making it immediately eligible for the
+    age-based sweep instead of getting the full retention window. Refreshing
+    the mtime is best-effort -- failure only shortens how long *aside*
+    survives before the sweep considers it.
+    """
+    dest.rename(aside)
+    try:
+        os.utime(aside)
+    except OSError:
+        pass
+
+
 async def _move_checkout_aside(dest: Path, log_lines: list[str]) -> Path | None:
     """Atomically rename *dest* to a sibling temp path under the app-sources root.
 
     Returns the new path, or ``None`` if the rename failed. Nothing is ever
     deleted here: the caller reports the failure and the retention sweep owns the
     moved-aside directory's eventual removal.
+
+    Cancellation safety: the rename+mtime-refresh runs on a retained worker
+    future, and the handler SETTLES that worker before inspecting *aside*.
+    Cancelling the awaiting task does not cancel a thread already running in
+    the executor -- ``asyncio.Future.cancel()`` returns while the worker runs
+    on -- so a bare ``if aside.exists():`` check would race the in-thread
+    rename: a worker past dispatch but pre-rename at check time would complete
+    the rename after the handler re-raised, stranding the checkout at *aside*
+    unrecorded. Awaiting the worker to completion first makes the inspection
+    deterministic: if the rename ran, this synchronously moves *aside* back to
+    *dest* so the caller's state is unchanged by the attempt; if that undo
+    itself fails, the aside path is logged (so it is never silently strandable)
+    before the cancellation is re-raised. A second cancel delivered while
+    settling re-raises and skips the undo -- acceptable, as the worker still
+    refreshed *aside*'s mtime in-thread, so it keeps the full retention window.
     """
     aside = dest.with_name(f"{dest.name}.stale-{uuid.uuid4().hex[:8]}")
+    loop = asyncio.get_running_loop()
+    # Retain the worker future so the CancelledError handler can settle it
+    # before inspecting *aside*; shield keeps a task cancel from propagating
+    # into the executor item (a thread cannot be cancelled anyway).
+    worker = loop.run_in_executor(None, _rename_and_refresh_mtime, dest, aside)
     try:
-        await asyncio.to_thread(dest.rename, aside)
+        await asyncio.shield(worker)
     except OSError as exc:
         log_lines.append(f"Could not move aside the checkout at {dest}: {exc}")
         return None
-    # Refresh mtime so the retention clock starts now, not at the checkout's
-    # last-modified time (which may already exceed the sweep threshold).
-    # Best-effort: failure only shortens how long the directory survives.
-    try:
-        await asyncio.to_thread(os.utime, aside)
-    except OSError:
-        pass
+    except asyncio.CancelledError:
+        # Settle the worker before inspecting *aside*: the shield delivered the
+        # cancel to us while the thread may still be mid-flight, and only once
+        # the worker has finished is aside.exists() an honest reading of whether
+        # the rename ran. asyncio.wait consumes the single delivered cancel and
+        # never re-raises the worker's own exception (we do not need its result,
+        # only that it settled).
+        await asyncio.wait({worker})
+        if aside.exists():
+            try:
+                aside.rename(dest)
+            except OSError as undo_exc:
+                log_lines.append(
+                    f"Cancelled while moving aside {dest}; the checkout is "
+                    f"retained at {aside} and could not be restored: {undo_exc}"
+                )
+        raise
     return aside
 
 
@@ -2070,9 +2118,7 @@ async def list_registry() -> list[dict[str, Any]]:
         except Exception:  # noqa: BLE001 - degrade, never 500 the store
             logger.warning("ignoring curated catalog copy after a failure", exc_info=True)
 
-    return _apply_trust_fields(
-        _enrich_with_install_status(entries, installed_map, detected)
-    )
+    return _apply_trust_fields(_enrich_with_install_status(entries, installed_map, detected))
 
 
 async def list_catalog_apps() -> list[dict[str, Any]]:
@@ -2925,15 +2971,11 @@ async def _git_fetch_commit(
             # fail, or the spawn itself may raise, and either way the directory is
             # ours to discard.
             created_here = True
-            code, out = await run(
-                ["git", "init", "--quiet", "--template=", str(dest)], timeout=15
-            )
+            code, out = await run(["git", "init", "--quiet", "--template=", str(dest)], timeout=15)
             if code != 0:
                 log_lines.append(f"git init failed (exit {code}): {out}")
                 return {"ok": False, "name": dest.name, "error": "git init failed"}
-            code, out = await run(
-                ["git", "remote", "add", "origin", git_url], cwd=dest, timeout=15
-            )
+            code, out = await run(["git", "remote", "add", "origin", git_url], cwd=dest, timeout=15)
             if code != 0:
                 log_lines.append(f"git remote add failed (exit {code}): {out}")
                 return {"ok": False, "name": dest.name, "error": "git remote add failed"}
@@ -3008,6 +3050,13 @@ async def _git_clone_or_pull(
     on the happy path; on failure, the old checkout has already been restored
     by this function's finally block.
 
+    If *restorable_stale* is provided (a mutable list), a moved-aside checkout
+    that is the SAME repository as the active one (a branch drift, not a
+    different repo) is additionally appended here. Only a path in BOTH
+    *pending_cleanup* and *restorable_stale* is safe to hand back as
+    ``restore_from`` on a later rejection — restoring an origin-mismatched
+    move-aside would give the build the exact tree an earlier gate refused.
+
     *index_originated* selects the credential posture (confused-deputy defense —
     see :func:`anonymous_git_env`). When ``False`` (the default: a bundled /
     owner-designated install) the clone keeps the gateway's ambient git/ssh
@@ -3074,6 +3123,10 @@ async def _git_clone_or_pull(
                 ),
             }
         if existing_origin != git_url:
+            # Parity with the branch-mismatch path below: say WHY the checkout
+            # is being replaced before doing it, naming the mismatched origin,
+            # so the install log records the re-clone reason instead of a bare
+            # move-aside line.
             log_lines.append(
                 f"Existing clone origin {existing_origin!r} does not match "
                 f"{git_url!r}; moving aside stale clone for re-clone"
@@ -3093,6 +3146,58 @@ async def _git_clone_or_pull(
                         "moved aside. Remove it manually and retry the install."
                     ),
                 }
+
+    if dest.is_dir() and (dest / ".git").is_dir():
+        # Origin is verified — but the checked-out branch may have drifted
+        # (e.g. a registry entry changed from branch A to branch B). If so,
+        # the same move-aside/re-clone treatment applies: do NOT checkout in
+        # place (local edits would be carried over silently), move the old
+        # checkout aside so it is preserved for manual recovery, then fall
+        # through to a fresh clone of the correct branch.
+        #
+        # IMPORTANT: Only move aside when a CONCRETE branch name was read AND
+        # it differs from the requested branch. When the read returns None
+        # (detached HEAD, unreadable .git/HEAD, gitfile layout) we fall
+        # through to the pull path — this is the pre-PR behavior for that
+        # checkout (non-destructive). Detached HEAD is the normal healthy
+        # state for tag-pinned entries (and for any commit-pinned checkout,
+        # which is always fetched detached — see :func:`_git_fetch_commit`);
+        # treating it as a confirmed mismatch would destroy a working
+        # checkout on every update cycle.
+        clone_branch = await asyncio.to_thread(_read_clone_branch, dest)
+        if clone_branch is None:
+            # Unknown branch state — do not destroy the checkout.
+            log_lines.append(
+                f"Cannot determine branch of existing checkout at {dest} "
+                f"(detached HEAD or unreadable .git/HEAD); skipping "
+                f"branch re-convergence and proceeding with pull"
+            )
+        elif clone_branch != branch:
+            log_lines.append(
+                f"Existing clone branch {clone_branch!r} does not match "
+                f"requested branch {branch!r}; moving aside for re-clone"
+            )
+            moved_aside = await _move_checkout_aside(dest, log_lines)
+            if moved_aside is None:
+                log_lines.append(
+                    f"Refusing to build from the checkout on the wrong branch at {dest}"
+                )
+                return {
+                    "ok": False,
+                    "name": dest.name,
+                    "error": "stale_clone_not_removed",
+                    "message": (
+                        "A checkout on the wrong branch is present and could not be "
+                        "moved aside. Remove it manually and retry the install."
+                    ),
+                }
+            # Origin was already verified identical above, so this is the SAME
+            # repository the user was on — only its branch drifted. That makes
+            # it restorable on a later build/install failure, exactly like the
+            # pinned-install move-aside below: a failed transaction must put
+            # the user's own (possibly edited) branch-A tree back rather than
+            # strand it as an undiscoverable `.stale-*` sibling.
+            moved_aside_is_restorable = True
 
     if dest.is_dir() and (dest / ".git").is_dir():
         if commit:
@@ -3140,11 +3245,12 @@ async def _git_clone_or_pull(
             # Fall through: `dest` no longer exists, so the pinned fetch below
             # creates it fresh inside the try/finally that owns restoration.
         else:
-            # Already cloned from the verified origin — fetch and fast-forward.
-            # (The origin-mismatch gate above guarantees this checkout's origin is
-            # byte-identical to git_url: a mismatched checkout was moved aside and
-            # never reused, so the fetch source and the provenance record are the
-            # same URL by construction.)
+            # Already cloned from the verified origin AND branch (or the branch
+            # state was unknown and re-convergence was skipped) — fetch and
+            # fast-forward. (The origin-mismatch gate above guarantees this
+            # checkout's origin is byte-identical to git_url: a mismatched
+            # checkout was moved aside and never reused, so the fetch source and
+            # the provenance record are the same URL by construction.)
             log_lines.append(f"Updating {git_url} (branch: {branch})...")
             # Route through wrap_argv (OS sandbox) THEN cgroup_scope_argv, matching
             # the fresh-clone path below — the cgroup DoS ceiling is the outermost
@@ -3307,6 +3413,22 @@ async def _git_clone_or_pull(
                         )
 
 
+def _restorable_or_none(pending: list[Path] | None, restorable: list[Path] | None) -> Path | None:
+    """Return the moved-aside checkout a refusal may restore, or None.
+
+    ``pending`` mirrors ``_pending_stale_cleanup`` (every move-aside this run,
+    regardless of reason) while ``restorable`` mirrors ``_restorable_stale``
+    (the same-repository subset — branch drift, not a different repo). Only a
+    path present in BOTH is safe to hand back as ``restore_from``: restoring
+    an origin-mismatched move-aside would give a rejection the exact tree an
+    earlier gate already refused.
+    """
+    if not pending:
+        return None
+    candidate = pending[0]
+    return candidate if candidate in (restorable or []) else None
+
+
 async def _clone_build_app(
     git_url: str,
     app_name: str,
@@ -3416,6 +3538,21 @@ async def _unpoison_rejected_checkout(
     (literal pathspecs keep an index-controlled subdirectory from being
     parsed as pathspec magic). Best-effort throughout: a cleanup failure is
     logged, never raised — the refusal it follows must stand regardless.
+
+    *manifest_relpath* is the untrusted registry-declared manifest path the
+    caller built (``f"{subdirectory}/app.json"``, or plain ``app.json`` when
+    no subdirectory was declared). A build step or ``onInstall`` script runs
+    with write access to the checkout BEFORE some callers reach this cleanup,
+    and can plant a symlink at the manifest path — the subdirectory OR the
+    leaf — after an earlier containment check already passed; this restore
+    then runs unsandboxed as the Kiro Crew process, so it must not trust that
+    earlier check. Containment of the FULL manifest path is re-verified HERE,
+    at the point of the write, against the CURRENT on-disk state: on a
+    failure the manifest restore (both the raw-write and the git-checkout
+    fallback) is skipped so neither can be redirected outside *pkg_dir*
+    through a symlink planted after the caller's check. The pre-pull
+    ``git reset`` above is unaffected — it targets the whole checkout, not
+    the manifest path.
     """
     if not checkout_preexisted:
         await asyncio.to_thread(shutil.rmtree, pkg_dir, ignore_errors=True)
@@ -3466,6 +3603,28 @@ async def _unpoison_rejected_checkout(
         # RuntimeError covers SandboxUnavailableError from wrap_argv — cleanup
         # is best-effort and must never mask the refusal it follows.
         logger.debug("post-rejection rollback failed for %s: %s", app_name, exc)
+    if _contained_join(pkg_dir, manifest_relpath) is None:
+        # manifest_relpath (the FULL path, e.g. "sub/app.json") no longer
+        # resolves inside pkg_dir RIGHT NOW — some callers reach this point
+        # after a build step or onInstall script ran with write access to the
+        # checkout, so a containment check the caller made earlier cannot be
+        # trusted here. Checking only `subdirectory` (the directory, and only
+        # when non-empty) misses a symlink planted at the manifest LEAF itself
+        # -- `subdirectory/app.json`, or plain `app.json` when there is no
+        # subdirectory -- which is exactly what the raw write and the
+        # git-checkout fallback below target; either would follow such a
+        # symlink and write outside pkg_dir as this unsandboxed process. Skip
+        # the manifest restore entirely rather than risk that write; the
+        # rollback above already ran and stands. Unconditional (no
+        # `if subdirectory` gate): the same leaf-symlink attack works with an
+        # empty subdirectory too, where manifest_relpath is just "app.json".
+        log_lines.append(
+            f"WARNING: {manifest_relpath!r} no longer resolves inside "
+            "the checkout; skipping manifest restore to avoid writing through "
+            "a symlink escape. A retry may keep rejecting until the source is "
+            "repaired."
+        )
+        return
     try:
         # Restore the manifest regardless — in its OWN guarded block so a
         # reset failure above cannot skip it: a build step or install script
@@ -3590,7 +3749,7 @@ async def _clone_build_app_locked(
             pre_pull_commit=pre_pull_commit,
             manifest_relpath=manifest_rel,
             manifest_snapshot=pre_update_manifest,
-            restore_from=(pending_cleanup[0] if pending_cleanup else None),
+            restore_from=_restorable_or_none(pending_cleanup, restorable_stale),
         )
 
     # ADMISSION GATE, second pass — on the CLONED manifest. The first pass ran
@@ -3625,7 +3784,7 @@ async def _clone_build_app_locked(
             pre_pull_commit=pre_pull_commit,
             manifest_relpath=manifest_rel,
             manifest_snapshot=pre_update_manifest,
-            restore_from=(pending_cleanup[0] if pending_cleanup else None),
+            restore_from=_restorable_or_none(pending_cleanup, restorable_stale),
         )
         return {
             "ok": False,
@@ -3825,6 +3984,43 @@ async def _run_app_build(
     return {"ok": True}
 
 
+def _report_retained_stale_checkouts(
+    build_result: dict[str, Any] | None,
+    log_lines: list[str],
+    *,
+    filter_restorable: bool,
+) -> None:
+    """Log a "Previous checkout retained at" line for each moved-aside
+    checkout that will actually stay retained after this call.
+
+    ``_pending_stale_cleanup`` collects every move-aside regardless of
+    reason, but ``_restorable_stale`` (a subset) is put back by the
+    enclosing ``finally`` — and ONLY when the caller's exit leaves
+    ``durable_success`` False. *filter_restorable* must mirror that:
+
+    - Pass ``True`` from a failure exit that precedes the ``finally``
+      restore (timeout, non-zero install script, generic exception, or an
+      install/update failure after a successful clone+build — none of these
+      set ``durable_success``). A restorable path there is about to be put
+      back, so reporting it as retained would be the exact
+      misleading-recovery report this guards against.
+    - Pass ``False`` from a durable-success exit (``durable_success`` is
+      already ``True``), where the ``finally`` never restores anything and a
+      restorable stale is genuinely retained at ``.stale-*`` until the
+      age-based sweep. Filtering it there — as the previous unconditional
+      filter did — is the possible-data-loss regression this parameter
+      exists to prevent: the checkout would sit unreported until swept.
+    """
+    if build_result is None:
+        return
+    restorable = set(build_result.get("_restorable_stale") or []) if filter_restorable else set()
+    for stale in build_result.get("_pending_stale_cleanup") or []:
+        if stale in restorable:
+            continue
+        log_lines.append(f"Previous checkout retained at: {stale}")
+        logger.info("Retained stale checkout: %s", stale)
+
+
 async def install_from_registry(
     name: str,
     log_lines: list[str] | None = None,
@@ -3965,7 +4161,9 @@ async def install_from_registry(
     # a repointed row on a trusted forge would otherwise be cloned with the
     # gateway's ambient git/ssh identity -- the confused-deputy read this posture
     # exists to prevent.
-    index_originated = _remote_controlled_url(entry)    # OFFICIALNESS is decided from `_registry` ALONE, and BEFORE the
+    index_originated = _remote_controlled_url(
+        entry
+    )  # OFFICIALNESS is decided from `_registry` ALONE, and BEFORE the
     # owner-designated carve-out below: that carve-out flips index_originated as a
     # CREDENTIAL decision (owner explicitly designated the repo), but an
     # external-index entry never becomes an official-catalog entry — install
@@ -4107,6 +4305,18 @@ async def install_from_registry(
     build_result: dict[str, Any] = {}
     # Cleared only after the transaction durably succeeds; the `finally` below reads it.
     durable_success = False
+    # Every `return` below assigns here first (named `outcome`, not `result` —
+    # the kirocrew-managed path below already uses `result` for the
+    # install_app/update_app return value). `"log"` is stamped from
+    # `log_lines` at assignment time, but the `finally` backstop can append to
+    # `log_lines` (a restore confirmation, or the restore-failed WARNING) AFTER
+    # that value is already computed — a `return`'s expression is evaluated
+    # before `finally` runs, and `str.join` produces an immutable copy, so a
+    # later append never reaches an already-built "log" string. Because
+    # dicts ARE mutable, holding the same object here and re-stamping
+    # `outcome["log"]` at the end of `finally` (below) closes that gap instead
+    # of the WARNING silently never reaching the log the user sees.
+    outcome: dict[str, Any] | None = None
     try:
         # Best-effort sweep of aged .stale-* / .partial-* dirs before the
         # install — prevents unbounded accumulation without blocking.
@@ -4131,7 +4341,8 @@ async def install_from_registry(
             commit=commit,
         )
         if not build_result["ok"]:
-            return {**build_result, "log": "\n".join(log_lines)}
+            outcome = {**build_result, "log": "\n".join(log_lines)}
+            return outcome
 
         app_source = build_result["pkg_dir"]
         clone_root = app_source
@@ -4142,12 +4353,56 @@ async def install_from_registry(
             # setup.onInstall) at an attacker-selected path outside the clone.
             contained = _contained_join(app_source, subdirectory)
             if contained is None:
-                return {
+                # subdirectory FAILED containment here — by definition it is
+                # an escaping value (absolute, "..", or a symlink pointing
+                # outside app_source). It must never be joined onto pkg_dir
+                # for a filesystem write; that is exactly what
+                # _contained_join guards against. The manifest-restore step
+                # of _unpoison_rejected_checkout writes to
+                # ``pkg_dir / manifest_relpath`` when checkout_preexisted is
+                # True, so passing the raw subdirectory as manifest_relpath
+                # there would let a symlinked subdirectory redirect that
+                # write outside the sandboxed checkout.
+                #
+                # A successful clone+build already ran (build_result["ok"] is
+                # True), so any moved-aside checkout from a branch/origin
+                # re-convergence must not be silently stranded by this
+                # refusal — but only the delete-this-run's-checkout /
+                # restore-previous-checkout branch of the helper (taken when
+                # checkout_preexisted is False) is safe here: it never
+                # touches manifest_relpath. When the checkout PRE-existed,
+                # skip cleanup entirely and return the refusal as-is rather
+                # than risk that write.
+                if not build_result.get("_checkout_preexisted"):
+                    # Restoring a moved-aside checkout here means giving the
+                    # rejected clone's own pkg_dir back to the CALLER as the
+                    # active checkout, even though the containment gate just
+                    # refused it. That is only safe for a restorable
+                    # (same-origin, branch-drift) stale, never for a
+                    # non-restorable (origin-mismatch, different repository)
+                    # one — restoring an origin-mismatched stale here is
+                    # exactly the "hand the build the tree the gate refused"
+                    # case _restorable_stale exists to prevent, so it must be
+                    # filtered out the same way every other restoration site
+                    # in this module filters it.
+                    await _unpoison_rejected_checkout(
+                        name,
+                        app_source_dir(name),
+                        log_lines,
+                        checkout_preexisted=False,
+                        pre_pull_commit="",
+                        restore_from=_restorable_or_none(
+                            build_result.get("_pending_stale_cleanup"),
+                            build_result.get("_restorable_stale"),
+                        ),
+                    )
+                outcome = {
                     "ok": False,
                     "name": name,
                     "error": f"unsafe subdirectory {subdirectory!r} escapes the app source root",
                     "log": "\n".join(log_lines),
                 }
+                return outcome
             app_source = contained
 
         # NOTE: a missing app.json is handled by the identity gate below
@@ -4180,7 +4435,7 @@ async def install_from_registry(
         # not a pass. ``install_app``/``update_app`` derive the installed
         # identity from this manifest, so it must still match the entry here.
         if manifest_data is None or str(manifest_data.get("name", "") or "") != name:
-            return await _refuse_identity_mismatch(
+            outcome = await _refuse_identity_mismatch(
                 name,
                 str((manifest_data or {}).get("name", "") or ""),
                 repo,
@@ -4190,8 +4445,12 @@ async def install_from_registry(
                 pre_pull_commit=str(build_result.get("_pre_pull_commit", "") or ""),
                 manifest_relpath=(f"{subdirectory}/app.json" if subdirectory else "app.json"),
                 manifest_snapshot=build_result.get("_pre_update_manifest"),
-                restore_from=next(iter(build_result.get("_pending_stale_cleanup") or []), None),
+                restore_from=_restorable_or_none(
+                    build_result.get("_pending_stale_cleanup"),
+                    build_result.get("_restorable_stale"),
+                ),
             )
+            return outcome
 
         # ADMISSION GATE, third pass — the post-build manifest is what
         # install_app/update_app will actually register, and a build step can
@@ -4225,14 +4484,18 @@ async def install_from_registry(
                 pre_pull_commit=str(build_result.get("_pre_pull_commit", "") or ""),
                 manifest_relpath=(f"{subdirectory}/app.json" if subdirectory else "app.json"),
                 manifest_snapshot=build_result.get("_pre_update_manifest"),
-                restore_from=next(iter(build_result.get("_pending_stale_cleanup") or []), None),
+                restore_from=_restorable_or_none(
+                    build_result.get("_pending_stale_cleanup"),
+                    build_result.get("_restorable_stale"),
+                ),
             )
-            return {
+            outcome = {
                 "ok": False,
                 "name": name,
                 "error": f"blocked by admission policy: {denied}",
                 "log": "\n".join(log_lines),
             }
+            return outcome
 
         # NOTE: the provenance commit AND signer are both resolved AFTER the
         # install-script block below — onInstall runs with write access to the
@@ -4284,12 +4547,17 @@ async def install_from_registry(
                 # Kill the entire process group (shell + children), reap the
                 # child, and escalate SIGTERM -> SIGKILL if it ignores the term.
                 await _kill_process_group(proc)
-                return {
+                # Surface any moved-aside checkout so it is not silently stranded.
+                # A failure exit: the outer `finally` will restore a restorable
+                # stale, so it must not also be reported as retained here.
+                _report_retained_stale_checkouts(build_result, log_lines, filter_restorable=True)
+                outcome = {
                     "ok": False,
                     "name": name,
                     "error": f"install script timed out after {_SCRIPT_TIMEOUT}s",
                     "log": "\n".join(log_lines),
                 }
+                return outcome
 
             lines = stdout.decode(errors="replace").strip().split("\n")
             if len(lines) > 50:
@@ -4299,12 +4567,17 @@ async def install_from_registry(
                 log_lines.extend(lines)
 
             if proc.returncode != 0:
-                return {
+                # Surface any moved-aside checkout so it is not silently stranded.
+                # A failure exit: the outer `finally` will restore a restorable
+                # stale, so it must not also be reported as retained here.
+                _report_retained_stale_checkouts(build_result, log_lines, filter_restorable=True)
+                outcome = {
                     "ok": False,
                     "name": name,
                     "error": f"install script failed (exit {proc.returncode})",
                     "log": "\n".join(log_lines),
                 }
+                return outcome
 
             # Reap any SURVIVING descendants of the script's process group
             # before the final gates re-read app.json: a backgrounded child
@@ -4348,7 +4621,7 @@ async def install_from_registry(
             except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
                 logger.debug("post-script app.json for %s is unreadable: %s", name, exc)
             if manifest_data is None or str(manifest_data.get("name", "") or "") != name:
-                return await _refuse_identity_mismatch(
+                outcome = await _refuse_identity_mismatch(
                     name,
                     str((manifest_data or {}).get("name", "") or ""),
                     repo,
@@ -4358,8 +4631,12 @@ async def install_from_registry(
                     pre_pull_commit=str(build_result.get("_pre_pull_commit", "") or ""),
                     manifest_relpath=(f"{subdirectory}/app.json" if subdirectory else "app.json"),
                     manifest_snapshot=build_result.get("_pre_update_manifest"),
-                    restore_from=next(iter(build_result.get("_pending_stale_cleanup") or []), None),
+                    restore_from=_restorable_or_none(
+                        build_result.get("_pending_stale_cleanup"),
+                        build_result.get("_restorable_stale"),
+                    ),
                 )
+                return outcome
             denied = app_admission_denied(
                 name,
                 manifest=AppManifest.from_dict(manifest_data),
@@ -4389,14 +4666,18 @@ async def install_from_registry(
                     pre_pull_commit=str(build_result.get("_pre_pull_commit", "") or ""),
                     manifest_relpath=(f"{subdirectory}/app.json" if subdirectory else "app.json"),
                     manifest_snapshot=build_result.get("_pre_update_manifest"),
-                    restore_from=next(iter(build_result.get("_pending_stale_cleanup") or []), None),
+                    restore_from=_restorable_or_none(
+                        build_result.get("_pending_stale_cleanup"),
+                        build_result.get("_restorable_stale"),
+                    ),
                 )
-                return {
+                outcome = {
                     "ok": False,
                     "name": name,
                     "error": f"blocked by admission policy: {denied}",
                     "log": "\n".join(log_lines),
                 }
+                return outcome
 
         # Provenance is pinned from the FINAL state — after the build, the
         # install script, and the last identity/admission gates: the exact
@@ -4465,9 +4746,10 @@ async def install_from_registry(
             log_lines.append("App will update its own registration on next launch")
             # Retain moved-aside checkouts so the user can recover local
             # edits; they will be swept after _STALE_CHECKOUT_RETENTION_DAYS.
-            for _stale in build_result.get("_pending_stale_cleanup") or []:
-                log_lines.append(f"Previous checkout retained at: {_stale}")
-                logger.info("Retained stale checkout: %s", _stale)
+            # durable_success is already True here: the outer `finally` will
+            # NOT restore, so a restorable stale must still be reported or it
+            # sits unlogged at `.stale-*` until the sweep deletes it.
+            _report_retained_stale_checkouts(build_result, log_lines, filter_restorable=False)
             if official_entry:
                 install_receipt.dispatch(
                     name,
@@ -4476,12 +4758,13 @@ async def install_from_registry(
                         install_receipt.KIND_UPDATE if was_installed else install_receipt.KIND_FRESH
                     ),
                 )
-            return {
+            outcome = {
                 "ok": True,
                 "name": name,
                 "message": f"installed {name} from {repo} (self-managed)",
                 "log": "\n".join(log_lines),
             }
+            return outcome
 
         # Kirocrew-managed: copy to ~/.kiro/crew/apps/ and register resources
         log_lines.append("Installing app...")
@@ -4522,9 +4805,10 @@ async def install_from_registry(
             )
             # Retain moved-aside checkouts so the user can recover local
             # edits; they will be swept after _STALE_CHECKOUT_RETENTION_DAYS.
-            for _stale in build_result.get("_pending_stale_cleanup") or []:
-                log_lines.append(f"Previous checkout retained at: {_stale}")
-                logger.info("Retained stale checkout: %s", _stale)
+            # durable_success is already True here: the outer `finally` will
+            # NOT restore, so a restorable stale must still be reported or it
+            # sits unlogged at `.stale-*` until the sweep deletes it.
+            _report_retained_stale_checkouts(build_result, log_lines, filter_restorable=False)
             if official_entry:
                 # Detached best-effort telemetry runs only after durable success.
                 install_receipt.dispatch(
@@ -4534,18 +4818,34 @@ async def install_from_registry(
                         install_receipt.KIND_UPDATE if was_installed else install_receipt.KIND_FRESH
                     ),
                 )
+        else:
+            # Install/update failed AFTER a successful clone+build.  The
+            # moved-aside checkout (if any) cannot be safely restored because
+            # pkg_dir now holds the freshly cloned+built tree.  Report the
+            # retained path so the user (and the sweep) know about it — same
+            # line the success paths use, so no stale-* is silently stranded.
+            # durable_success was never set on this branch, so the outer
+            # `finally` will still attempt to restore a restorable stale —
+            # filter it here so it is not double-reported as retained.
+            _report_retained_stale_checkouts(build_result, log_lines, filter_restorable=True)
 
-        return {
+        outcome = {
             "ok": result.ok,
             "name": name,
             "message": result.message,
             "error": result.error,
             "log": "\n".join(log_lines),
         }
+        return outcome
 
     except Exception as exc:
         logger.exception("Failed to install %s from registry", name)
-        return {"ok": False, "name": name, "error": str(exc), "log": "\n".join(log_lines)}
+        # Surface any moved-aside checkout so it is not silently stranded.
+        # A failure exit: the outer `finally` will restore a restorable
+        # stale, so it must not also be reported as retained here.
+        _report_retained_stale_checkouts(build_result, log_lines, filter_restorable=True)
+        outcome = {"ok": False, "name": name, "error": str(exc), "log": "\n".join(log_lines)}
+        return outcome
     finally:
         # RESTORATION BELONGS TO THE LIFETIME, NOT TO THE LIST OF FAILURES.
         #
@@ -4589,3 +4889,15 @@ async def install_from_registry(
                     "WARNING: the previous checkout could not be restored; recover it "
                     "from the .stale-* sibling directory"
                 )
+
+        # Re-stamp AFTER any restoration above: every `return` in this function
+        # built `outcome["log"]` via `"\n".join(log_lines)` before this `finally`
+        # ran, and that produced an immutable string snapshot — the restore
+        # confirmation or the restore-failed WARNING just appended above would
+        # otherwise never reach the log the caller actually receives, silently
+        # defeating the "must be visible in the log the user sees" guarantee
+        # right above. `outcome` is the SAME dict object being returned (dicts
+        # are mutable, unlike the string it briefly held), so mutating its
+        # "log" key here updates what the caller gets.
+        if outcome is not None:
+            outcome["log"] = "\n".join(log_lines)

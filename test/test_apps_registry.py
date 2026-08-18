@@ -228,9 +228,7 @@ async def test_list_registry_reaps_detect_probe_tree_on_timeout(monkeypatch):
     monkeypatch.setattr(registry, "_resolve_manifest", _resolve)
     # Return the entries themselves: list_registry's tail now feeds this
     # result into _apply_trust_fields, which iterates rows as dicts.
-    monkeypatch.setattr(
-        registry, "_enrich_with_install_status", lambda e, m, d: e
-    )
+    monkeypatch.setattr(registry, "_enrich_with_install_status", lambda e, m, d: e)
 
     proc = _TimeoutProc()
     killed = _record_tree_kill(monkeypatch)
@@ -542,9 +540,7 @@ async def test_cloned_manifest_admission_is_revalidated_before_build(monkeypatch
 
     monkeypatch.setattr(registry, "_run_app_build", _fake_run_build)
 
-    result = await registry._clone_build_app(
-        "https://example.com/demo.git", "demoapp", []
-    )
+    result = await registry._clone_build_app("https://example.com/demo.git", "demoapp", [])
 
     assert result["ok"] is False
     assert "admission" in result["error"]
@@ -568,6 +564,8 @@ async def test_reused_checkout_pull_never_repoints_origin(monkeypatch, tmp_path)
 
     monkeypatch.setattr(registry, "_clone_origin_url", _fake_origin)
 
+    monkeypatch.setattr(registry, "_read_clone_branch", lambda clone_dir: "main")
+
     spawned: list[list[str]] = []
 
     class _Proc:
@@ -585,9 +583,7 @@ async def test_reused_checkout_pull_never_repoints_origin(monkeypatch, tmp_path)
     monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (cmd, None))
     monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: cmd)
 
-    err = await registry._git_clone_or_pull(
-        "https://example.com/new-home.git", "main", dest, []
-    )
+    err = await registry._git_clone_or_pull("https://example.com/new-home.git", "main", dest, [])
 
     assert err is None
     assert spawned[0][:2] == ["git", "pull"]
@@ -631,6 +627,8 @@ async def test_failed_pull_aborts_instead_of_installing_stale_code(monkeypatch, 
 
     monkeypatch.setattr(registry, "_clone_origin_url", _fake_origin)
 
+    monkeypatch.setattr(registry, "_read_clone_branch", lambda clone_dir: "main")
+
     class _Proc:
         pid = 4242
 
@@ -649,9 +647,7 @@ async def test_failed_pull_aborts_instead_of_installing_stale_code(monkeypatch, 
     monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (cmd, None))
     monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: cmd)
 
-    err = await registry._git_clone_or_pull(
-        "https://example.com/demo.git", "main", dest, []
-    )
+    err = await registry._git_clone_or_pull("https://example.com/demo.git", "main", dest, [])
 
     assert err is not None and err["ok"] is False
     assert "stale" in err["error"]
@@ -667,7 +663,7 @@ async def test_provenance_signer_uses_post_script_manifest(monkeypatch, tmp_path
     manifest; provenance must record the FINAL manifest's signer."""
     src = tmp_path / "app-sources" / "demoapp"
     script = (
-        "python3 -c \"import json;json.dump("
+        'python3 -c "import json;json.dump('
         "{'name':'demoapp','version':'2.0.0'},open('app.json','w'))\""
     )
     _identity_harness(
@@ -730,9 +726,7 @@ async def test_admission_rejection_deletes_fresh_clone(monkeypatch, tmp_path):
         return None
 
     monkeypatch.setattr(registry, "_git_clone_or_pull", _fake_clone)
-    monkeypatch.setattr(
-        registry, "app_admission_denied", lambda *a, **k: "unsigned under policy"
-    )
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: "unsigned under policy")
 
     result = await registry._clone_build_app("https://example.com/demo.git", "demoapp", [])
 
@@ -755,9 +749,7 @@ async def test_admission_rejection_rolls_back_preexisting_checkout(monkeypatch, 
         return None
 
     monkeypatch.setattr(registry, "_git_clone_or_pull", _fake_clone)
-    monkeypatch.setattr(
-        registry, "app_admission_denied", lambda *a, **k: "unsigned under policy"
-    )
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: "unsigned under policy")
 
     spawned: list[list[str]] = []
 
@@ -899,9 +891,7 @@ async def test_postscript_admission_rejection_rolls_back_preexisting_checkout(
     def _fake_killpg(pgid, sig):
         reaped.append(pgid)
 
-    monkeypatch.setattr(
-        registry.platform_compat, "kill_process_tree_async", _fake_tree_kill
-    )
+    monkeypatch.setattr(registry.platform_compat, "kill_process_tree_async", _fake_tree_kill)
     monkeypatch.setattr(registry.os, "killpg", _fake_killpg, raising=False)
 
     result = await registry.install_from_registry("demoapp")
@@ -915,18 +905,19 @@ async def test_postscript_admission_rejection_rolls_back_preexisting_checkout(
     assert 4242 in reaped
     # The manifest file is restored from HEAD as well: a script rewriting
     # app.json is a working-tree edit the reset alone cannot undo.
-    assert any(
-        cmd[:4] == ["git", "--literal-pathspecs", "checkout", "--"] for cmd in spawned
-    )
+    assert any(cmd[:4] == ["git", "--literal-pathspecs", "checkout", "--"] for cmd in spawned)
 
 
 @pytest.mark.asyncio
-async def test_moveaside_reclone_treated_as_fresh_on_rejection(monkeypatch, tmp_path):
+async def test_moveaside_reclone_retained_not_restored_on_rejection(monkeypatch, tmp_path):
     """When the origin-mismatch gate moves an old checkout aside and
     fresh-clones, a rejection must delete the fresh re-clone (never preserve it
-    or reset it toward the moved-aside repository's commit) and RESTORE the
-    moved-aside previous checkout — otherwise the slot is left empty and the
-    user's old workspace is stranded as a sweeper-doomed .stale-* sibling."""
+    or reset it toward the moved-aside repository's commit) and must NOT
+    restore the moved-aside previous checkout: an origin-mismatch move-aside is
+    a DIFFERENT repository, so handing it back to the slot would give a later
+    retry the very tree this gate already refused. It stays RETAINED as a
+    `.stale-*` sibling (recoverable by hand, swept on a retention timer), which
+    is why only a same-origin/branch-drift move-aside is ever restored."""
     src = tmp_path / "app-sources" / "demoapp"
     (src / ".git").mkdir(parents=True)  # OLD checkout pre-exists (origin A)
     (src / "old-work.txt").write_text("precious", encoding="utf-8")
@@ -935,7 +926,9 @@ async def test_moveaside_reclone_treated_as_fresh_on_rejection(monkeypatch, tmp_
     monkeypatch.setattr(registry, "_resolved_clone_commit", lambda root: "a" * 40)
 
     async def _fake_clone(git_url, branch, dest, log_lines, **kwargs):
-        # Simulate the origin-mismatch move-aside + fresh re-clone.
+        # Simulate the origin-mismatch move-aside + fresh re-clone. Only
+        # `pending_cleanup` is populated, never `restorable_stale` — an
+        # origin-mismatch move is never restorable.
         moved = dest.with_name("demoapp.stale-deadbeef")
         dest.rename(moved)
         cleanup = kwargs.get("pending_cleanup")
@@ -946,9 +939,7 @@ async def test_moveaside_reclone_treated_as_fresh_on_rejection(monkeypatch, tmp_
         return None
 
     monkeypatch.setattr(registry, "_git_clone_or_pull", _fake_clone)
-    monkeypatch.setattr(
-        registry, "app_admission_denied", lambda *a, **k: "unsigned under policy"
-    )
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: "unsigned under policy")
 
     spawned: list[list[str]] = []
 
@@ -972,11 +963,13 @@ async def test_moveaside_reclone_treated_as_fresh_on_rejection(monkeypatch, tmp_
     assert result["ok"] is False
     # No rollback is attempted toward the moved-aside repo's commit ...
     assert not any(cmd[:3] == ["git", "reset", "--keep"] for cmd in spawned)
-    # ... the rejected re-clone is gone, and the PREVIOUS checkout is back.
-    assert src.exists()
-    assert (src / "old-work.txt").read_text(encoding="utf-8") == "precious"
-    assert not (src / "app.json").exists()  # the rejected clone's manifest is gone
-    assert not src.with_name("demoapp.stale-deadbeef").exists()  # moved back, not stranded
+    # ... the rejected re-clone is gone from the active slot ...
+    assert not src.exists()
+    # ... and the ORIGIN-mismatched previous checkout is retained, not
+    # restored into the slot the gate just refused it for.
+    stale = src.with_name("demoapp.stale-deadbeef")
+    assert stale.exists()
+    assert (stale / "old-work.txt").read_text(encoding="utf-8") == "precious"
 
 
 @pytest.mark.asyncio
@@ -1094,9 +1087,7 @@ async def test_identity_refusal_rolls_back_preexisting_checkout(monkeypatch, tmp
     # ... but un-poisoned: rolled back to the pre-pull commit AND the manifest
     # restored from HEAD.
     assert any(cmd[:4] == ["git", "reset", "--keep", "b" * 40] for cmd in spawned)
-    assert any(
-        cmd[:4] == ["git", "--literal-pathspecs", "checkout", "--"] for cmd in spawned
-    )
+    assert any(cmd[:4] == ["git", "--literal-pathspecs", "checkout", "--"] for cmd in spawned)
 
 
 @pytest.mark.asyncio
@@ -1143,7 +1134,10 @@ def test_entry_git_url_tolerates_non_string_values():
     assert registry._entry_git_url({"gitUrl": {"evil": True}}) == ""
     assert registry._entry_git_url({"gitUrl": ["x"], "repo": None}) == ""
     assert registry._entry_git_url({"repo": 42}) == ""
-    assert registry._entry_git_url({"gitUrl": " https://ok.example/r.git "}) == "https://ok.example/r.git"
+    assert (
+        registry._entry_git_url({"gitUrl": " https://ok.example/r.git "})
+        == "https://ok.example/r.git"
+    )
 
 
 class TestMinimalEnvHonorsWindowsCaseInsensitivity:
@@ -1206,9 +1200,9 @@ class TestApplyTrustFields:
         entry = {
             "name": "evil-app",
             "_registry": "evil-registry",
-            "author": "KiroCrew",       # brand-ok: author-spoof fixture
-            "origin": "builtin",        # origin spoof
-            "featured": True,           # spotlight self-flag
+            "author": "KiroCrew",  # brand-ok: author-spoof fixture
+            "origin": "builtin",  # origin spoof
+            "featured": True,  # spotlight self-flag
         }
         (out,) = registry._apply_trust_fields([entry])
         assert out["provenance"] == "external"
@@ -1240,10 +1234,17 @@ class TestApplyTrustFields:
         """A third-party core repo publishing ``"author": "kirocrew"`` in its
         app.json gains nothing: the merged ``author`` display field is not
         consulted, only the pre-merge index snapshot is."""
-        entry = {"name": "sneaky", "author": "KiroCrew"}  # merged, no snapshot  # brand-ok: author-spoof fixture
+        entry = {
+            "name": "sneaky",
+            "author": "KiroCrew",  # brand-ok: author-spoof fixture
+        }  # merged, no snapshot
         (out,) = registry._apply_trust_fields([entry])
         assert out["verified"] is False
-        entry = {"name": "sneaky2", "author": "KiroCrew", "_index_author": "third-party"}  # brand-ok: author-spoof fixture
+        entry = {
+            "name": "sneaky2",
+            "author": "KiroCrew",  # brand-ok: author-spoof fixture
+            "_index_author": "third-party",
+        }
         (out,) = registry._apply_trust_fields([entry])
         assert out["verified"] is False
 
@@ -1339,12 +1340,19 @@ class TestApplyTrustFields:
         """End-to-end: every row returned by ``list_registry`` carries the
         server-computed fields; external spoofs and a manifest-published
         ``author: "kirocrew"`` are all neutralized."""
-        core = {"name": "core-app", "author": "KiroCrew", "featured": 1}  # brand-ok: author-spoof fixture
+        core = {
+            "name": "core-app",
+            "author": "KiroCrew",  # brand-ok: author-spoof fixture
+            "featured": 1,
+        }
         # Third-party core entry whose REPO manifest claims the first-party
         # author (index declares none) — must not mint the badge.
         sneaky = {"name": "sneaky-app"}
         # Index entry trying to pre-seed the internal snapshot key directly.
-        preseed = {"name": "preseed-app", "_index_author": "KiroCrew"}  # brand-ok: author-spoof fixture
+        preseed = {
+            "name": "preseed-app",
+            "_index_author": "KiroCrew",  # brand-ok: author-spoof fixture
+        }
         ext = {
             "name": "ext-app",
             "_registry": "labs",
@@ -1352,9 +1360,7 @@ class TestApplyTrustFields:
             "origin": "builtin",
             "featured": True,
         }
-        monkeypatch.setattr(
-            registry, "_load_registry_file", lambda: [core, sneaky, preseed]
-        )
+        monkeypatch.setattr(registry, "_load_registry_file", lambda: [core, sneaky, preseed])
 
         async def _fake_external():
             return [ext]
@@ -1383,6 +1389,8 @@ class TestApplyTrustFields:
         assert "featured" not in rows["ext-app"]
         # The internal snapshot key never leaks into the API payload.
         assert all("_index_author" not in r for r in rows.values())
+
+
 # ---------------------------------------------------------------------------
 # Git-install build step: the interpreter, and where the build runs.
 #
@@ -1660,9 +1668,7 @@ class TestCatalogFailureNeverBreaksTheStore:
     """
 
     async def _rows(self, monkeypatch):
-        monkeypatch.setattr(
-            registry, "_load_registry_file", lambda: [{"name": "seed-app"}]
-        )
+        monkeypatch.setattr(registry, "_load_registry_file", lambda: [{"name": "seed-app"}])
 
         async def _no_external():
             return []
@@ -1713,9 +1719,7 @@ class TestCatalogFailureNeverBreaksTheStore:
         assert "seed-app" in rows
 
     @pytest.mark.asyncio
-    async def test_the_failure_is_logged_rather_than_swallowed(
-        self, monkeypatch, caplog
-    ):
+    async def test_the_failure_is_logged_rather_than_swallowed(self, monkeypatch, caplog):
         """A broad catch is only acceptable because it is loud: without the
         traceback this would hide our own bugs instead of a bad document.
 
@@ -1726,9 +1730,7 @@ class TestCatalogFailureNeverBreaksTheStore:
         def boom():
             raise RuntimeError("kaboom")
 
-        monkeypatch.setattr(
-            registry.official_catalog, "fetch_inventory_entries", boom
-        )
+        monkeypatch.setattr(registry.official_catalog, "fetch_inventory_entries", boom)
         with caplog.at_level("WARNING", logger=registry.logger.name):
             await self._rows(monkeypatch)
         assert any("catalog" in r.message for r in caplog.records)
