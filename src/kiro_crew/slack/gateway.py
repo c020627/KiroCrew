@@ -2825,6 +2825,11 @@ class GatewayOrchestrator:
                             True,
                             interactive=False,
                             agent=agent,
+                            # ``msg`` has already had crew variables expanded by
+                            # build_cron_session_context, so trigger matching gets
+                            # the author's own text instead: a variable VALUE must
+                            # never be able to pull in a skill body.
+                            trigger_text=job.message,
                         )
                         # Wall clock for the cron agent turn: acp never assigns
                         # TurnUsage.duration_ms, so the row falls back to this.
@@ -2951,6 +2956,9 @@ class GatewayOrchestrator:
                     True,
                     interactive=False,
                     agent=job.agent_id or None,
+                    # Expanded upstream; triggers see the authored text. See the
+                    # sequential site above.
+                    trigger_text=job.message,
                     provider_type=_provider,
                     minimal_context=job.minimal_context,
                 )
@@ -3718,7 +3726,7 @@ class GatewayOrchestrator:
             if self.autonudge_svc:
                 await self.autonudge_svc.remove(loop.id)
             return False
-        msg_body = render_nudge_message(loop.message, loop.stop_sentinel_path)
+        msg_body = render_nudge_message(loop.message, loop.stop_sentinel_path, loop.agent)
         tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
         # Fail closed: an unattended turn MUST run under the HookManager
         # PreToolUse governance gate (mirrors cron's default approval path).
@@ -3738,7 +3746,17 @@ class GatewayOrchestrator:
             _acquired = True
             _provider = self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
             full_msg, _ = await run_in_embed_pool(
-                self.ctx_builder.build_message, tagged, is_new, key, provider_type=_provider
+                self.ctx_builder.build_message,
+                tagged,
+                is_new,
+                key,
+                provider_type=_provider,
+                # ``tagged`` wraps a body render_nudge_message already expanded, so
+                # triggers match the loop's authored instruction instead.
+                trigger_text=loop.message,
+                # The loop's armed crew, so the system prompt resolves the same
+                # crew's variables the body was rendered with.
+                crew=loop.agent or None,
             )
             # Clock started outside wait_for so BOTH the success path and the
             # TimeoutError branch below can report the real elapsed time. acp
@@ -3899,7 +3917,7 @@ class GatewayOrchestrator:
         if sessions is not None and sessions.is_busy(key):
             logger.info("AutoNudge skip: discord session %s busy (loop %s)", key, loop.id)
             return False
-        msg_body = render_nudge_message(loop.message, loop.stop_sentinel_path)
+        msg_body = render_nudge_message(loop.message, loop.stop_sentinel_path, loop.agent)
         tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
         try:
             conversation_id = await transport.resolve_conversation(user_id)
@@ -3990,7 +4008,7 @@ class GatewayOrchestrator:
                 loop.slot_key,
                 loop.id,
             )
-        msg = render_nudge_message(loop.message, loop.stop_sentinel_path)
+        msg = render_nudge_message(loop.message, loop.stop_sentinel_path, loop.agent)
         tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg}"
         from kiro_crew.dashboard.chat import (
             _run_chat,  # circular import: gateway -> dashboard.chat -> gateway (chat dispatch references GatewayOrchestrator)

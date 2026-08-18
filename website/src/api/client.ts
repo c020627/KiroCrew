@@ -1386,6 +1386,51 @@ export interface WebhookRunRecord {
   detail?: string
 }
 
+/**
+ * `GET /api/variables` — every scope's stored pairs plus the resolved cascade.
+ *
+ * `effective` is the map an agent turn would actually see for the requested
+ * context, and `winning_scope` names which layer supplied each of those values
+ * (`global` | `workspace` | `crew` | `session`). The two together are what lets a
+ * row say "this pair is stored here but something narrower wins".
+ */
+export interface VariablesView {
+  global: Record<string, string>
+  /** Keyed by workspace name; each entry holds only that workspace's OWN pairs. */
+  workspaces: Record<string, Record<string, string>>
+  effective: Record<string, string>
+  winning_scope: Record<string, string>
+  /**
+   * Pairs that come from `config.local.json` rather than `config.json`.
+   *
+   * `PUT /api/variables` writes only `config.json`, so these are not deletable
+   * through this endpoint: the key would be dropped from a file that may not hold
+   * it and the overlay would re-supply it on the next load. The panel does NOT
+   * render this yet — it is reported so the distinction exists in the contract and
+   * a follow-up can mark those rows read-only instead of showing a delete that
+   * appears to succeed and then reappears.
+   */
+  overlay_owned?: {
+    global: string[]
+    workspaces: Record<string, string[]>
+  }
+}
+
+/**
+ * `PUT /api/variables` — the complete pair set for ONE scope.
+ *
+ * A whole-scope write rather than a per-key one: deleting a pair is then just its
+ * absence from `values`, with no second verb and no ambiguity between "unset" and
+ * "set to the empty string" — an empty string is a legal value that still wins
+ * over a broader scope, so the two cannot share an encoding.
+ */
+export interface VariablesWrite {
+  scope: 'global' | 'workspace'
+  /** Required when `scope` is `workspace`; ignored otherwise. */
+  workspace?: string
+  values: Record<string, string>
+}
+
 export interface WebhooksView {
   /** Effective state: `has_tokens && switch_on`. */
   enabled: boolean
@@ -1931,6 +1976,12 @@ export const api = {
   kirocrewConfig: () => fetch('/api/config/kirocrew').then(j),
   saveKirocrewConfig: (agent: object) => put('/api/config/kirocrew', { agent }).then(j) as Promise<{ ok?: boolean; restart_required?: boolean; error?: string }>,
   patchConfig: (path: string, value: unknown) => fetch('/api/config/kirocrew', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, value }) }).then(j),
+  // Environment variables (crew variables). `variables()` returns every scope's
+  // pairs plus the resolved effective map; `saveVariables()` replaces the whole
+  // pair set at ONE named scope, which is what makes a delete expressible — a
+  // per-key PATCH cannot say "this key is gone" without a second verb.
+  variables: () => fetch('/api/variables').then(j) as Promise<VariablesView>,
+  saveVariables: (body: VariablesWrite) => put('/api/variables', body).then(j) as Promise<{ ok?: boolean; error?: string; key?: string }>,
   // Optional integrations — backend endpoints are graceful no-ops on a public
   // install (AIM / kiro usage are stubbed). Kept so the UI compiles and
   // degrades gracefully (panels render empty when the feature is absent).
