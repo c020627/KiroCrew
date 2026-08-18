@@ -13,7 +13,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
-import { McpManagement } from '../pages/settings/McpManagement'
+import { McpManagement, stubEligible } from '../pages/settings/McpManagement'
 import { api } from '../api/client'
 
 type Server = {
@@ -42,7 +42,16 @@ function server(over: Partial<Server> = {}): Server {
 }
 
 function mount() {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  // `staleTime: Infinity` mirrors the app's real shared QueryClient
+  // (`src/api/queryClient.ts`), where freshness comes from WebSocket
+  // invalidation rather than from age. Without it this harness is more lenient
+  // than production in exactly the direction that hides a bug: a cache-backed
+  // re-read that is a no-op in the app still refetches here, so a test asserting
+  // "acts on the fresh value" passes while the shipped code acts on the stale
+  // one.
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  })
   return render(
     <MemoryRouter>
       <QueryClientProvider client={qc}>
@@ -669,5 +678,313 @@ describe('the warning reaches the decision point', () => {
     const marked = (await screen.findAllByText('shared', { selector: 'span' }))
       .filter(el => el.querySelector('svg') !== null)
     expect(marked).toHaveLength(1)
+  })
+})
+
+// The bulk action, whose whole risk is claiming to have done more than it did.
+describe('stub every server the evidence allows', () => {
+  // What the engine actually emits for each tier: MEASURED recommends the stub
+  // and withholds sharing (the pre-flight compares the handshake, not tool-call
+  // state), DECLARED recommends both.
+  const measured = {
+    strength: 'measured',
+    recommendStub: true,
+    recommendShare: false,
+    reasons: [{ code: 'preflight_passed', detail: '' }],
+  }
+  const declared = {
+    strength: 'declared',
+    recommendStub: true,
+    recommendShare: true,
+    reasons: [
+      { code: 'declares_caller_identity', detail: '' },
+      { code: 'preflight_passed', detail: '' },
+    ],
+  }
+  const disqualified = {
+    strength: 'disqualified',
+    recommendStub: false,
+    recommendShare: false,
+    reasons: [{ code: 'first_party_session_scoped', detail: '' }],
+  }
+  const idleProgress = { running: false, done: 0, total: 0, error: '' }
+
+  it('batches exactly the eligible rows and leaves the rest alone', async () => {
+    const { fireEvent } = await import('@testing-library/react')
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
+    vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue(idleProgress as never)
+    const start = vi.spyOn(api, 'mcpMeasureStart').mockResolvedValue(idleProgress as never)
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+      servers: [
+        { ...server({ name: 'good-mcp' }), recommendation: declared },
+        // Sharing is ON, so a measured-only row is NOT eligible: stubbing it here
+        // would co-tenant a server nothing proved can partition its state.
+        { ...server({ name: 'measured-mcp' }), recommendation: measured },
+        { ...server({ name: 'bad-mcp' }), recommendation: disqualified },
+        { ...server({ name: 'done-mcp', stub: true, in_allowlist: true }), recommendation: declared },
+      ],
+    } as never)
+    const many = vi
+      .spyOn(api, 'mcpGatewaySetStubMany')
+      .mockResolvedValue({ ok: true, names: ['good-mcp'], stub: true, applied: true } as never)
+
+    mount()
+    // Wait for the rows, not just the button: the control is correctly disabled
+    // until a verdict is known, so clicking at first paint hits a dead button.
+    await screen.findByText('good-mcp')
+    const btn = await screen.findByRole('button', { name: /evidence allows/i })
+    fireEvent.click(btn)
+
+    await waitFor(() => expect(many).toHaveBeenCalled())
+    // One request for the whole set — a per-row loop could land the allowlist
+    // half-flipped — carrying only the row that earned it.
+    expect(many).toHaveBeenCalledTimes(1)
+    expect(many).toHaveBeenCalledWith(['good-mcp'], true, true)
+    // Nothing was unmeasured, so no spawns were paid for.
+    expect(start).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.getByText(/Stubbed 1\./)).toBeTruthy())
+  })
+
+  it('re-reads the sharing switch after the wait instead of trusting the click', async () => {
+    // The measurement pass runs for minutes and the sharing switch is a separate
+    // control, so it can be turned ON meanwhile. Filtering against the value that
+    // was true at click time would admit a recommendStub-only server and
+    // co-tenant it against its own verdict.
+    const { fireEvent } = await import('@testing-library/react')
+    vi.useFakeTimers()
+    try {
+      vi.spyOn(api, 'mcpGatewayStatus')
+        .mockResolvedValueOnce(status({ enabled: false }) as never)
+        .mockResolvedValue(status({ enabled: true }) as never)
+      vi.spyOn(api, 'mcpMeasureStart').mockResolvedValue({ ...idleProgress, running: true } as never)
+      vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue(idleProgress as never)
+      // The row carries its verdict from the FIRST response, so eligibility here
+      // turns on the sharing value alone: stale `false` makes this
+      // recommendStub-only row eligible and the batch fires, fresh `true` makes
+      // it ineligible and nothing is written. Leaving the first response without
+      // a verdict would let the test pass for the wrong reason -- an unmeasured
+      // row is ineligible either way.
+      vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+        servers: [{ ...server({ name: 'fresh-mcp' }), recommendation: measured }],
+      } as never)
+      const many = vi
+        .spyOn(api, 'mcpGatewaySetStubMany')
+        .mockResolvedValue({ ok: true, names: [], stub: true, applied: true } as never)
+
+      mount()
+      await vi.waitFor(() => screen.getByText('fresh-mcp'))
+      fireEvent.click(screen.getByRole('button', { name: /evidence allows/i }))
+      await vi.advanceTimersByTimeAsync(2 * 1000)
+
+      // Sharing came back ON, so the measured row is not eligible and the batch
+      // never fires.
+      await vi.waitFor(() => screen.getByText(/Stubbed 0\./))
+      expect(many).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('measures the unmeasured before deciding, then acts on the fresh verdicts', async () => {
+    const { fireEvent } = await import('@testing-library/react')
+    vi.useFakeTimers()
+    try {
+      vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
+      const start = vi.spyOn(api, 'mcpMeasureStart').mockResolvedValue({
+        ...idleProgress,
+        running: true,
+      } as never)
+      vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue(idleProgress as never)
+      // First render has no verdict; the re-read after the pass has one. Acting
+      // on the first would skip the very server the operator just installed.
+      const servers = vi
+        .spyOn(api, 'mcpGatewayServers')
+        .mockResolvedValueOnce({ servers: [server({ name: 'fresh-mcp' })] } as never)
+        .mockResolvedValue({
+          servers: [{ ...server({ name: 'fresh-mcp' }), recommendation: declared }],
+        } as never)
+      const many = vi
+        .spyOn(api, 'mcpGatewaySetStubMany')
+        .mockResolvedValue({ ok: true, names: ['fresh-mcp'], stub: true, applied: true } as never)
+
+      mount()
+      // The unmeasured row is what enables the button here — the eligible set is
+      // empty until the pass runs, which is the whole point of this case.
+      await vi.waitFor(() => screen.getByText('fresh-mcp'))
+      fireEvent.click(screen.getByRole('button', { name: /evidence allows/i }))
+      // Past the first progress poll, which reports the pass already finished.
+      await vi.advanceTimersByTimeAsync(2 * 1000)
+
+      await vi.waitFor(() => expect(many).toHaveBeenCalledWith(['fresh-mcp'], true, true))
+      expect(start).toHaveBeenCalledTimes(1)
+      expect(servers.mock.calls.length).toBeGreaterThan(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('shows the live pass position instead of a counter frozen at zero', async () => {
+    // The wait runs for up to four minutes. A hardcoded 0 read as a stalled pass
+    // on exactly the fresh install this control serves, so the poll's readings
+    // have to reach the line beside the button.
+    const { fireEvent } = await import('@testing-library/react')
+    vi.useFakeTimers()
+    try {
+      vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
+      vi.spyOn(api, 'mcpMeasureStart').mockResolvedValue({ ...idleProgress, running: true } as never)
+      vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue({
+        running: true,
+        done: 3,
+        total: 7,
+        error: '',
+      } as never)
+      vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+        servers: [server({ name: 'fresh-mcp' })],
+      } as never)
+
+      mount()
+      await vi.waitFor(() => screen.getByText('fresh-mcp'))
+      fireEvent.click(screen.getByRole('button', { name: /evidence allows/i }))
+      await vi.advanceTimersByTimeAsync(2 * 1000)
+
+      await vi.waitFor(() => screen.getByText(/3 of 7/))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('changes nothing while a pass it started is still running', async () => {
+    const { fireEvent } = await import('@testing-library/react')
+    vi.useFakeTimers()
+    try {
+      vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
+      vi.spyOn(api, 'mcpMeasureStart').mockResolvedValue({ ...idleProgress, running: true } as never)
+      // Never stops: the wait has to give up rather than act on a half-measured
+      // fleet, which would stub whatever happened to be done by then.
+      vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue({
+        running: true,
+        done: 1,
+        total: 9,
+        error: '',
+      } as never)
+      vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+        servers: [server({ name: 'fresh-mcp' })],
+      } as never)
+      const many = vi.spyOn(api, 'mcpGatewaySetStubMany')
+
+      mount()
+      await vi.waitFor(() => screen.getByText('fresh-mcp'))
+      fireEvent.click(screen.getByRole('button', { name: /evidence allows/i }))
+      // Past the wait deadline.
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000)
+
+      expect(many).not.toHaveBeenCalled()
+      await vi.waitFor(() => screen.getByText(/Still measuring/i))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('refuses to act when the sharing switch moved between the read and the write', async () => {
+    // The compare-and-set the server enforces. Nothing was written, so the line
+    // must say that rather than reporting a failure the operator would re-press
+    // blind, or worse, a count of work that did not happen.
+    const { fireEvent } = await import('@testing-library/react')
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
+    vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue(idleProgress as never)
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+      servers: [{ ...server({ name: 'good-mcp' }), recommendation: declared }],
+    } as never)
+    const many = vi
+      .spyOn(api, 'mcpGatewaySetStubMany')
+      .mockRejectedValue(new Error('409 sharing_state_changed'))
+
+    mount()
+    await screen.findByText('good-mcp')
+    fireEvent.click(await screen.findByRole('button', { name: /evidence allows/i }))
+
+    // The expectation rides along so the server can refuse in the first place.
+    await waitFor(() => expect(many).toHaveBeenCalledWith(['good-mcp'], true, true))
+    await waitFor(() => expect(screen.getByText(/sharing changed while/i)).toBeTruthy())
+    expect(screen.queryByText(/Stubbed/)).toBeNull()
+  })
+
+  it('renders the measured tier with its own label, not "not measured"', async () => {
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
+    vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue(idleProgress as never)
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+      servers: [{ ...server({ name: 'good-mcp' }), recommendation: measured }],
+    } as never)
+    mount()
+    ;(await screen.findByRole('tab', { name: /sharing assessment/i })).click()
+    // An unmapped tier falls back to "not measured", which would read as the
+    // measurement having never happened.
+    expect(await screen.findByText(/measured, no divergence/i)).toBeTruthy()
+  })
+})
+
+describe('stubEligible', () => {
+  const rec = (over: Partial<{ strength: string; recommendStub: boolean; recommendShare: boolean }> = {}) => ({
+    strength: 'no_objection',
+    recommendStub: true,
+    recommendShare: false,
+    reasons: [],
+    ...over,
+  })
+
+  it('takes the stub flag while sharing is off and the share flag while it is on', () => {
+    // Same row, same verdict, two answers: with sharing off a stub keeps the
+    // backend 1:1 with the session, so the weakest useful verdict is enough;
+    // with sharing on the identical click hands the server co-tenants.
+    const s = { ...server(), recommendation: rec() } as never
+    expect(stubEligible(s, false)).toBe(true)
+    expect(stubEligible(s, true)).toBe(false)
+  })
+
+  it('includes a declared server once sharing is on, because that claims isolation', () => {
+    const s = {
+      ...server(),
+      recommendation: rec({ strength: 'declared', recommendShare: true }),
+    } as never
+    expect(stubEligible(s, true)).toBe(true)
+  })
+
+  it('stubs a measured server but does not co-tenant it', () => {
+    // MEASURED means the handshake replayed identically, not that the server can
+    // partition its own state. The engine encodes that as recommendStub without
+    // recommendShare, and the button must not widen it.
+    const s = {
+      ...server(),
+      recommendation: rec({ strength: 'measured', recommendStub: true, recommendShare: false }),
+    } as never
+    expect(stubEligible(s, false)).toBe(true)
+    expect(stubEligible(s, true)).toBe(false)
+  })
+
+  it('skips a server whose declared env a shared backend would withhold', () => {
+    // The rewriter leaves that entry unwrapped, so stubbing it produces no
+    // shared backend — counting it would report work the broker skips.
+    const s = {
+      ...server({ pooling_blocked_by_env: true } as never),
+      recommendation: rec({ strength: 'declared', recommendShare: true }),
+    } as never
+    expect(stubEligible(s, true)).toBe(false)
+    // With sharing off there is no pooled spawn to withhold anything.
+    expect(stubEligible({ ...(s as object), recommendation: rec() } as never, false)).toBe(true)
+  })
+
+  it('never guesses for a row with no verdict', () => {
+    // An older gateway reached through Make Live sends no verdict field at all.
+    expect(stubEligible(server() as never, false)).toBe(false)
+  })
+
+  it('leaves an already-stubbed row out of the batch', () => {
+    const s = { ...server({ stub: true, in_allowlist: true }), recommendation: rec() } as never
+    expect(stubEligible(s, false)).toBe(false)
+  })
+
+  it('never offers a server that cannot be stubbed at all', () => {
+    const s = { ...server({ can_stub: false }), recommendation: rec() } as never
+    expect(stubEligible(s, false)).toBe(false)
   })
 })

@@ -73,6 +73,11 @@ export type McpShareReason = {
  */
 export type McpShareRecommendation = {
   strength: string
+  // Two axes, not one verdict. `recommendStub` is the safe half — Kiro Crew's
+  // stub in the path, backend still 1:1 with the session — while
+  // `recommendShare` is the one that introduces co-tenancy. A bulk action has to
+  // consult whichever one the global sharing switch makes true of a click.
+  recommendStub: boolean
   recommendShare: boolean
   reasons: McpShareReason[]
 }
@@ -102,6 +107,12 @@ export type McpManagedServer = {
   agents: string[]         // agent configs that declare this server
   transport: string        // "stdio" (stubbable) or "http" (no stdio pipe to interpose on)
   denylisted: boolean      // in UNPOOLABLE_SERVERS — can never be pooled
+  // True when stubbing this server cannot produce a SHARED backend anyway: the
+  // rewriter leaves an env-declaring entry unwrapped rather than spawn a pooled
+  // backend without a declared key. Optional for the same reason as
+  // `recommendation` — an older gateway does not send it, and its absence must
+  // read as "no obstacle known", not as an obstacle.
+  pooling_blocked_by_env?: boolean
   // Optional because the field is only as old as the shareability detector: a
   // dashboard served from this build can be pointed at an older gateway (Make
   // Live to an earlier worktree), and a row with no verdict must read as "not
@@ -1922,7 +1933,13 @@ export const api = {
   mcpMeasureProgress: () => fetch('/api/mcp/measure').then(j) as Promise<McpMeasureProgress>,
   // Batch form of the above — one config write + one pool re-apply for the whole
   // set, so "toggle all" can't land the allowlist half-flipped.
-  mcpGatewaySetStubMany: (names: string[], stub: boolean) => post('/api/mcp-gateway/servers/stub', { names, stub }).then(j) as Promise<{ ok: boolean; names: string[]; stub: boolean; enabled?: boolean; applied?: boolean; stub_servers?: string[] }>,
+  //
+  // `expectSharing` is a compare-and-set on the sharing switch for a caller whose
+  // choice of WHICH names to send depended on it: the server re-reads the
+  // persisted state under the same lock the sharing toggle holds and refuses with
+  // 409 `sharing_state_changed` if it no longer matches. Omit it when the choice
+  // does not depend on sharing.
+  mcpGatewaySetStubMany: (names: string[], stub: boolean, expectSharing?: boolean) => post('/api/mcp-gateway/servers/stub', expectSharing === undefined ? { names, stub } : { names, stub, expect_sharing: expectSharing }).then(j) as Promise<{ ok: boolean; names: string[]; stub: boolean; enabled?: boolean; applied?: boolean; stub_servers?: string[] }>,
   // Agent config
   agentConfig: () => fetch('/api/agent/config').then(j),
   saveAgentConfig: (config: object) => put('/api/agent/config', { config }).then(j),

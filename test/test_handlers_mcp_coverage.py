@@ -1255,13 +1255,24 @@ def routed_allowlist(monkeypatch: pytest.MonkeyPatch):
     """Pin ``KiroCrewConfig.load().mcp_gateway.stub_servers``."""
     import kiro_crew.config.loader as loader
 
-    def _set(names: list[str]) -> None:
+    def _set(names: list[str], *, enabled: bool = False, forward_declared_env: bool = False) -> None:
         # ``socket_path`` is part of the real ``McpGatewayConfig`` and the
         # handler reads it to locate the observed-hazard ledger. A double that
         # omitted it would make the row builder raise on a field production
         # always has — empty is the honest stand-in for "no broker configured".
+        #
+        # ``enabled`` + ``forward_declared_env`` are read for the same reason:
+        # together they decide whether stubbing a server could produce a SHARED
+        # backend at all, which the row reports as ``pooling_blocked_by_env``.
+        # Defaults match a fresh install (sharing off, no forwarding), so the
+        # existing cases keep describing the state they were written for.
         cfg = SimpleNamespace(
-            mcp_gateway=SimpleNamespace(stub_servers=list(names), socket_path="")
+            mcp_gateway=SimpleNamespace(
+                stub_servers=list(names),
+                socket_path="",
+                enabled=enabled,
+                forward_declared_env=forward_declared_env,
+            )
         )
         monkeypatch.setattr(loader.KiroCrewConfig, "load", staticmethod(lambda: cfg))
 
@@ -1285,6 +1296,227 @@ def _seed_probe(monkeypatch, *names: str) -> None:
 
 
 class TestGatewayServers:
+    @pytest.mark.asyncio
+    async def test_a_batch_is_refused_when_the_sharing_switch_moved_under_it(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``expect_sharing`` is a compare-and-set, not a second stale read.
+
+        The dashboard's bulk action picks names by asking the verdict engine the
+        question that matches the sharing state: with sharing OFF a
+        ``recommend_stub`` verdict is enough, with sharing ON it takes
+        ``recommend_share``. That choice is only sound while the state it was made
+        under still holds, and sharing is a separate switch another dashboard can
+        flip. Without the check the batch would land stub-only servers in a pool
+        that had meanwhile been turned on.
+        """
+        import kiro_crew.config.loader as loader
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({"mcp_gateway": {"enabled": True, "stub_servers": []}}))
+        # Patch the LOADER's name: the handler re-imports ``config_path`` from
+        # ``kiro_crew.config.loader`` inside the function body, so patching this
+        # module's copy is silently ignored.
+        monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+        monkeypatch.setattr(
+            loader.KiroCrewConfig,
+            "load",
+            staticmethod(
+                lambda: SimpleNamespace(
+                    mcp_gateway=SimpleNamespace(
+                        enabled=True, stub_servers=[], socket_path="", forward_declared_env=False
+                    )
+                )
+            ),
+        )
+
+        # The caller composed its list believing sharing was OFF; it is ON.
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"names": ["a-mcp"], "stub": True, "expect_sharing": False})
+        )
+        assert resp.status == 409
+        body = _payload(resp)
+        assert body["code"] == "sharing_state_changed"
+        assert body["enabled"] is True
+        # Refused means NOTHING was written, not "written but flagged".
+        assert json.loads(cfg_path.read_text())["mcp_gateway"]["stub_servers"] == []
+
+        # The same batch with the matching expectation goes through.
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"names": ["a-mcp"], "stub": True, "expect_sharing": True})
+        )
+        assert resp.status == 200
+        assert json.loads(cfg_path.read_text())["mcp_gateway"]["stub_servers"] == ["a-mcp"]
+
+    @pytest.mark.asyncio
+    async def test_a_single_toggle_never_needs_the_compare_and_set(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Absent ``expect_sharing`` means "do not check".
+
+        The per-row switch's meaning does not depend on the sharing state, and an
+        older dashboard served from a previous build sends no such field. Neither
+        may be refused.
+        """
+        import kiro_crew.config.loader as loader
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({"mcp_gateway": {"enabled": True, "stub_servers": []}}))
+        # Patch the LOADER's name: the handler re-imports ``config_path`` from
+        # ``kiro_crew.config.loader`` inside the function body, so patching this
+        # module's copy is silently ignored.
+        monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+        monkeypatch.setattr(
+            loader.KiroCrewConfig,
+            "load",
+            staticmethod(
+                lambda: SimpleNamespace(
+                    mcp_gateway=SimpleNamespace(
+                        enabled=True, stub_servers=[], socket_path="", forward_declared_env=False
+                    )
+                )
+            ),
+        )
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"name": "a-mcp", "stub": True})
+        )
+        assert resp.status == 200
+        assert json.loads(cfg_path.read_text())["mcp_gateway"]["stub_servers"] == ["a-mcp"]
+
+    @pytest.mark.asyncio
+    async def test_the_stub_write_goes_through_the_locked_config_primitive(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The compare-and-set is only sound inside a CROSS-PROCESS lock.
+
+        ``_MCP_GATEWAY_APPLY_LOCK`` and ``_get_config_lock`` are asyncio locks:
+        they serialize this gateway's own handlers and say nothing about another
+        process. The CLI writes ``mcp_gateway.enabled`` through the same file, so a
+        bare read followed by a write leaves a window where sharing turns on
+        between the check and the batch -- and stub-only servers land in a pool
+        that is now shared.
+
+        ``update_config_locked`` holds an advisory ``flock`` for the whole
+        read-modify-write, and its own docstring names it the required path for new
+        config.json mutations. This asserts the batch actually uses it rather than
+        re-implementing the read-then-write it replaced; a regression to
+        ``write_config_atomically`` would reopen the window silently, since every
+        behavioural test still passes with the lock removed.
+        """
+        import kiro_crew.config.loader as loader
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({"mcp_gateway": {"enabled": True, "stub_servers": []}}))
+        monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+
+        seen: list[str] = []
+        real = loader.update_config_locked
+
+        def _recording_update(path=None, **kwargs):  # type: ignore[no-untyped-def]
+            seen.append("locked")
+            return real(path, **kwargs)
+
+        monkeypatch.setattr(loader, "update_config_locked", _recording_update)
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"names": ["a-mcp"], "stub": True, "expect_sharing": True})
+        )
+        assert resp.status == 200
+        # Empty means the handler wrote config.json some other way, which is the
+        # regression: a direct ``write_config_atomically`` passes every behavioural
+        # test in this file while reopening the cross-process window.
+        assert seen == ["locked"]
+        assert json.loads(cfg_path.read_text())["mcp_gateway"]["stub_servers"] == ["a-mcp"]
+
+    @pytest.mark.asyncio
+    async def test_the_stub_write_also_holds_the_lock_agent_crud_writes_under(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The file lock excludes other PROCESSES; it does not exclude this one.
+
+        Agent CRUD saves config through ``cfg.save()`` ->
+        ``write_config_atomically``, which takes no advisory file lock and
+        serializes only on ``_get_config_lock``. So the two guards cover disjoint
+        sets of writers: holding only the file lock leaves an in-process agent
+        save free to interleave with this read-modify-write and silently drop one
+        of the two changes.
+
+        The offload is what makes this reachable -- ``await asyncio.to_thread``
+        yields the event loop mid-write. Asserting the lock is HELD while the
+        offloaded write runs is what a behavioural test cannot see: removing
+        ``_get_config_lock`` leaves every stub assertion in this file passing.
+        """
+        import kiro_crew.config.loader as loader
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({"mcp_gateway": {"enabled": True, "stub_servers": []}}))
+        monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+
+        held_during_write: list[bool] = []
+        real = loader.update_config_locked
+        # ``_get_config_lock`` calls ``asyncio.get_running_loop()``, so it can only
+        # be resolved here on the event loop -- the recorder below runs on a
+        # ``to_thread`` worker. ``Lock.locked()`` needs no loop, so capture the
+        # object now and only read its state from the thread.
+        lock = _get_config_lock()
+
+        def _checking_update(path=None, **kwargs):  # type: ignore[no-untyped-def]
+            held_during_write.append(lock.locked())
+            return real(path, **kwargs)
+
+        monkeypatch.setattr(loader, "update_config_locked", _checking_update)
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"names": ["a-mcp"], "stub": True, "expect_sharing": True})
+        )
+        assert resp.status == 200
+        assert held_during_write == [True], (
+            "the config lock agent CRUD writes under must be held across the "
+            "offloaded write, not merely taken somewhere in the handler"
+        )
+
+    @pytest.mark.asyncio
+    async def test_declared_env_blocks_pooling_only_while_sharing_is_on(
+        self, agents_dir: Path, routed_allowlist
+    ) -> None:
+        """The row has to say when stubbing could not produce a SHARED backend.
+
+        The rewriter leaves an env-declaring entry unwrapped rather than spawn a
+        pooled backend without a declared key, so a bulk action that stubbed it
+        would report work the broker then silently skips. With sharing OFF there
+        is no pooled spawn to withhold anything, so the same server is not
+        blocked — the flag describes the pooled path, not the server.
+        """
+        (agents_dir / "a.json").write_text(
+            json.dumps(
+                {
+                    "name": "alpha",
+                    "mcpServers": {
+                        "declares-env": {"command": "run", "env": {"HOME_DIR": "/x"}},
+                        "no-env": {"command": "run"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        routed_allowlist([], enabled=True)
+        rows = {r["name"]: r for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]}
+        assert rows["declares-env"]["pooling_blocked_by_env"] is True
+        assert rows["no-env"]["pooling_blocked_by_env"] is False
+
+        # Same config, sharing off: nothing is pooled, so nothing is withheld.
+        routed_allowlist([], enabled=False)
+        rows = {r["name"]: r for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]}
+        assert rows["declares-env"]["pooling_blocked_by_env"] is False
+
+        # Forwarding on: only the rotating-secret and credential classes are
+        # withheld, so an ordinary declared key stops blocking.
+        routed_allowlist([], enabled=True, forward_declared_env=True)
+        rows = {r["name"]: r for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]}
+        assert rows["declares-env"]["pooling_blocked_by_env"] is False
+
     @pytest.mark.asyncio
     async def test_missing_agents_dir_yields_no_rows(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, routed_allowlist
