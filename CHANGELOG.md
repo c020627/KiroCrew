@@ -4,6 +4,23 @@ All notable changes to KiroCrew are documented in this file.
 
 ## [Unreleased]
 
+- **A bounded history fetch taken while an agent is mid-reply now returns the
+  last N messages instead of a mid-sentence fragment.** `chunk` is a wire-only
+  role appended once per streamed delta, so a reply still being typed occupies
+  hundreds of rows that render as a single message. Two endpoints bounded that
+  window by raw row count before folding it: `GET /api/chat/slots/{slot}` spent
+  a `limit` of 24 entirely inside the unfinished reply and returned a fragment
+  with none of the conversation behind it, and `POST
+  /api/chat/slots/{slot}/resume` filled its 200-row bound the same way, which
+  truncated the in-flight reply itself to the newest 200 deltas. This hit
+  hardest where mid-reply is the normal condition rather than an edge case: a
+  view that polls to watch an agent work showed less of the thread the more the
+  agent said. Both paths now reduce the wire-only rows first -- `chunk` runs
+  fold to one row, `done` terminators drop -- so a bound counts displayed
+  messages, the in-flight text arrives whole, and `total` and the paging cursor
+  stop counting stream progress. Persisted history was never affected -- these
+  rows never reach disk -- so scroll-back paging is unchanged. (#4306)
+
 - **MCP servers can now be measured for shareability on purpose, and the answer
   survives until the server itself changes.** The Sharing assessment could only
   say as much as the number of servers carrying a measurement, and reaching one

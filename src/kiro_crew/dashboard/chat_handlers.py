@@ -53,6 +53,7 @@ from kiro_crew.dashboard.chat_utils import (
     _MANUAL_RESUME_MSG,
     SYNTHETIC_RECOVERY_KIND,
     _build_stream_chunk,
+    _collapse_wire_rows,
     _edit_queued_by_id,
     _emit_agent_assignment,
     _history_key_for,
@@ -1197,7 +1198,21 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         current_session_disk = max(0, disk_len - slot._disk_older_count)
         unflushed = mem_len - current_session_disk
         if unflushed > 0:
-            all_msgs = list(all_msgs) + list(slot.messages[-unflushed:])
+            # One row must mean one displayed message BEFORE `limit` is
+            # applied. `chunk` and `done` are wire-only and never persisted, so
+            # this tail is the only place they appear: a segment still streaming
+            # is hundreds of rows that render as one message, and a terminator
+            # renders as nothing. Slicing first spends the caller's budget on
+            # rows the response will not carry, so it returns a mid-sentence
+            # fragment, or one message short of what was asked for.
+            #
+            # Scoped to the tail, which is window-sized, because this runs on
+            # the event loop: reducing the disk rows too would be whole-history
+            # work here, which is what the render offload below exists to keep
+            # off the loop, and it would buy nothing since those rows hold no
+            # wire-only role. A disk row that does carry one is left to the
+            # render pass, same as on the unbounded branch.
+            all_msgs = list(all_msgs) + _collapse_wire_rows(slot.messages[-unflushed:])
         total = len(all_msgs)
         if before is not None:
             end = max(0, min(before, total))
@@ -1207,9 +1222,9 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         messages = all_msgs[start:end]
         has_more = start > 0
         # The cursor the client should send next, in the RAW index space this
-        # slice was taken in. The client cannot derive it from the response: the
-        # returned rows are _prepare_messages output, which collapses chunk runs
-        # and drops done, so their count is not the span consumed here.
+        # slice was taken in. The client cannot derive it from the response:
+        # `_prepare_messages` drops `done`, so the returned row count is not
+        # the span consumed here.
         next_before = start
 
     # Snapshot every slot field the response needs BEFORE leaving the event
@@ -3981,8 +3996,24 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
                     error="app does not own this slot",
                 )
                 return web.json_response({"error": "not found"}, status=404)
-        total = len(existing.messages)
-        recent = existing.messages[-200:] if total > 200 else existing.messages
+        # Reduce the wire-only rows before bounding, for the same reason the
+        # detail handler does: a segment still streaming is hundreds of `chunk`
+        # rows that render as one message, so a raw 200-row bound over the live
+        # window can be filled entirely by one unfinished reply -- and it then
+        # returns only that window's slice of the reply, dropping the text
+        # ahead of it. Reducing first makes the bound, `total` and the cursor
+        # below all count displayed messages.
+        #
+        # It also puts the cursor's two terms in the same unit: persisted rows
+        # carry no wire-only role, so `_disk_older_count` is already a message
+        # count, while a raw window length is not.
+        #
+        # O(window) on the event loop, and the window is capped -- the
+        # `_prepare_messages` redaction pass on the next line is the larger
+        # cost at this call site either way.
+        window = _collapse_wire_rows(existing.messages)
+        total = len(window)
+        recent = window[-200:] if total > 200 else window
         prepared = _prepare_messages(recent, existing.running)
         # Raw index this window starts at: the frozen on-disk prefix plus the
         # in-memory rows it skipped. has_more is derived from the same number so
