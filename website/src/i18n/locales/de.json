@@ -801,6 +801,26 @@
         "start_a_new_one_several_can_run_at_once": "Starte ein neues — mehrere können gleichzeitig laufen."
       }
     },
+    "commandBar": {
+      "cmd_new_session": "Neue Sitzung",
+      "cmd_search_sessions": "Sitzungen durchsuchen",
+      "fallback_sessions": "Sitzungen nach „{{query}}“ durchsuchen",
+      "group_apps": "Apps",
+      "group_commands": "Befehle",
+      "group_settings": "Einstellungen",
+      "keep_typing": "Mindestens {{min}} Zeichen eingeben",
+      "leave_scope": "Zurück zu allen Befehlen",
+      "manifest": {
+        "display_name": "Befehlsleiste",
+        "description": "Ersetzt die Schnellsuche (Cmd+K / Ctrl+K) durch einen Starter: einen Befehl eingeben, keine Suchanfrage. Die erste Seite enthaelt App-Befehle, Ziele und Systemeinstellungen und stellt keine Anfrage, sodass Tippen nichts kostet; die Sitzungssuche wird eine Zeile, die man betritt."
+      },
+      "no_matches": "Keine passenden Befehle",
+      "no_sessions": "Keine passenden Sitzungen",
+      "placeholder": "Befehl eingeben…",
+      "placeholder_sessions": "Alle Sitzungen durchsuchen…",
+      "searching": "Suche läuft…",
+      "title": "Befehlsleiste"
+    },
     "crewCompanion": {
       "accessory": {
         "coffee": "Kaffee",

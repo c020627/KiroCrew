@@ -4243,6 +4243,26 @@
         "select_a_run_to_see_its_phases_agents_and_result": "इसके चरण, एजेंट और परिणाम देखने के लिए कोई रन चुनें।",
         "unknown": "अज्ञात"
       }
+    },
+    "commandBar": {
+      "cmd_new_session": "नया सेशन",
+      "cmd_search_sessions": "सेशन खोजें",
+      "fallback_sessions": "सेशन में “{{query}}” खोजें",
+      "group_apps": "ऐप",
+      "group_commands": "कमांड",
+      "group_settings": "सेटिंग्स",
+      "keep_typing": "कम से कम {{min}} अक्षर लिखें",
+      "leave_scope": "सभी कमांड पर वापस",
+      "manifest": {
+        "display_name": "कमांड बार",
+        "description": "क्विक सर्च (Cmd+K / Ctrl+K) की जगह एक लॉन्चर देता है: खोज शब्द नहीं, कमांड लिखें। पहले पेज पर ऐप कमांड, ठिकाने और सिस्टम सेटिंग्स होती हैं और वह कोई रिक्वेस्ट नहीं भेजता, इसलिए टाइप करना मुफ़्त है; सेशन खोज एक ऐसी पंक्ति बन जाती है जिसमें जाना होता है।"
+      },
+      "no_matches": "कोई कमांड मेल नहीं खाता",
+      "no_sessions": "कोई सेशन मेल नहीं खाता",
+      "placeholder": "कोई कमांड लिखें…",
+      "placeholder_sessions": "सभी सेशन खोजें…",
+      "searching": "खोज रहे हैं…",
+      "title": "कमांड बार"
     }
   },
   "autoImprovement": {

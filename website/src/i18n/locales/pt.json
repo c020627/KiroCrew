@@ -4307,6 +4307,26 @@
         "select_a_run_to_see_its_phases_agents_and_result": "Selecione uma execução para ver suas fases, agentes e resultado.",
         "unknown": "Desconhecido"
       }
+    },
+    "commandBar": {
+      "cmd_new_session": "Nova sessão",
+      "cmd_search_sessions": "Pesquisar sessões",
+      "fallback_sessions": "Pesquisar “{{query}}” nas sessões",
+      "group_apps": "Aplicativos",
+      "group_commands": "Comandos",
+      "group_settings": "Configurações",
+      "keep_typing": "Digite ao menos {{min}} caracteres",
+      "leave_scope": "Voltar para todos os comandos",
+      "manifest": {
+        "display_name": "Barra de comandos",
+        "description": "Substitui a busca rapida (Cmd+K / Ctrl+K) por um lancador: digite um comando, nao uma busca. A primeira pagina traz comandos de aplicativos, destinos e configuracoes do sistema e nao faz nenhuma requisicao, entao digitar nao custa nada; a busca de sessoes passa a ser uma linha em que voce entra."
+      },
+      "no_matches": "Nenhum comando corresponde",
+      "no_sessions": "Nenhuma sessão corresponde",
+      "placeholder": "Digite um comando…",
+      "placeholder_sessions": "Pesquisar em todas as sessões…",
+      "searching": "Pesquisando…",
+      "title": "Barra de comandos"
     }
   },
   "autoImprovement": {

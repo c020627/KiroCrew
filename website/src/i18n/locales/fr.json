@@ -826,6 +826,26 @@
         "start_a_new_one_several_can_run_at_once": "Lances-en une nouvelle — plusieurs peuvent tourner en même temps."
       }
     },
+    "commandBar": {
+      "cmd_new_session": "Nouvelle session",
+      "cmd_search_sessions": "Rechercher des sessions",
+      "fallback_sessions": "Rechercher « {{query}} » dans les sessions",
+      "group_apps": "Applications",
+      "group_commands": "Commandes",
+      "group_settings": "Paramètres",
+      "keep_typing": "Saisissez au moins {{min}} caractères",
+      "leave_scope": "Retour à toutes les commandes",
+      "manifest": {
+        "display_name": "Barre de commandes",
+        "description": "Remplace la recherche rapide (Cmd+K / Ctrl+K) par un lanceur : saisissez une commande, pas une requete. La premiere page contient les commandes d applications, les destinations et les parametres systeme et n emet aucune requete, donc la saisie ne coute rien ; la recherche de sessions devient une ligne dans laquelle on entre."
+      },
+      "no_matches": "Aucune commande correspondante",
+      "no_sessions": "Aucune session correspondante",
+      "placeholder": "Saisissez une commande…",
+      "placeholder_sessions": "Rechercher dans toutes les sessions…",
+      "searching": "Recherche…",
+      "title": "Barre de commandes"
+    },
     "crewCompanion": {
       "accessory": {
         "coffee": "Café",

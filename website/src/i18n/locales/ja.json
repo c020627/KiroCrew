@@ -776,6 +776,26 @@
         "start_a_new_one_several_can_run_at_once": "新しく開始してください — 複数を同時に実行できます。"
       }
     },
+    "commandBar": {
+      "cmd_new_session": "新しいセッション",
+      "cmd_search_sessions": "セッションを検索",
+      "fallback_sessions": "セッションを「{{query}}」で検索",
+      "group_apps": "アプリ",
+      "group_commands": "コマンド",
+      "group_settings": "設定",
+      "keep_typing": "{{min}} 文字以上入力してください",
+      "leave_scope": "すべてのコマンドに戻る",
+      "manifest": {
+        "display_name": "コマンドバー",
+        "description": "クイック検索（Cmd+K / Ctrl+K）をランチャーに置き換えます。検索語ではなくコマンドを入力します。最初のページはアプリのコマンド、移動先、システム設定だけでリクエストを出さないため、入力に費用がかかりません。セッション検索は入って使う行になります。"
+      },
+      "no_matches": "一致するコマンドはありません",
+      "no_sessions": "一致するセッションはありません",
+      "placeholder": "コマンドを入力…",
+      "placeholder_sessions": "すべてのセッションを検索…",
+      "searching": "検索中…",
+      "title": "コマンドバー"
+    },
     "crewCompanion": {
       "accessory": {
         "coffee": "コーヒー",

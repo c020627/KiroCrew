@@ -4307,6 +4307,26 @@
         "select_a_run_to_see_its_phases_agents_and_result": "Seleziona un'esecuzione per vederne le fasi, gli agenti e il risultato.",
         "unknown": "Sconosciuto"
       }
+    },
+    "commandBar": {
+      "cmd_new_session": "Nuova sessione",
+      "cmd_search_sessions": "Cerca sessioni",
+      "fallback_sessions": "Cerca «{{query}}» nelle sessioni",
+      "group_apps": "App",
+      "group_commands": "Comandi",
+      "group_settings": "Impostazioni",
+      "keep_typing": "Digita almeno {{min}} caratteri",
+      "leave_scope": "Torna a tutti i comandi",
+      "manifest": {
+        "display_name": "Barra dei comandi",
+        "description": "Sostituisce la ricerca rapida (Cmd+K / Ctrl+K) con un launcher: digita un comando, non una ricerca. La prima pagina contiene comandi delle app, destinazioni e impostazioni di sistema e non invia richieste, quindi digitare non costa nulla; la ricerca delle sessioni diventa una riga in cui si entra."
+      },
+      "no_matches": "Nessun comando corrispondente",
+      "no_sessions": "Nessuna sessione corrispondente",
+      "placeholder": "Digita un comando…",
+      "placeholder_sessions": "Cerca in tutte le sessioni…",
+      "searching": "Ricerca…",
+      "title": "Barra dei comandi"
     }
   },
   "autoImprovement": {

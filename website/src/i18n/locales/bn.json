@@ -4243,6 +4243,26 @@
         "select_a_run_to_see_its_phases_agents_and_result": "ফেজ, এজেন্ট ও ফলাফল দেখতে একটি রান বেছে নিন।",
         "unknown": "অজানা"
       }
+    },
+    "commandBar": {
+      "cmd_new_session": "নতুন সেশন",
+      "cmd_search_sessions": "সেশন খুঁজুন",
+      "fallback_sessions": "সেশনে “{{query}}” খুঁজুন",
+      "group_apps": "অ্যাপ",
+      "group_commands": "কমান্ড",
+      "group_settings": "সেটিংস",
+      "keep_typing": "অন্তত {{min}} অক্ষর লিখুন",
+      "leave_scope": "সব কমান্ডে ফিরে যান",
+      "manifest": {
+        "display_name": "কমান্ড বার",
+        "description": "কুইক সার্চ (Cmd+K / Ctrl+K) এর জায়গায় একটি লঞ্চার দেয়: খোঁজার শব্দ নয়, কমান্ড লিখুন। প্রথম পাতায় থাকে অ্যাপ কমান্ড, গন্তব্য ও সিস্টেম সেটিংস, আর সেটি কোনো রিকোয়েস্ট পাঠায় না, তাই টাইপ করা বিনামূল্যে; সেশন খোঁজা এমন একটি সারি হয়ে যায় যেখানে ঢুকতে হয়।"
+      },
+      "no_matches": "কোনো কমান্ড মেলেনি",
+      "no_sessions": "কোনো সেশন মেলেনি",
+      "placeholder": "কমান্ড লিখুন…",
+      "placeholder_sessions": "সব সেশন খুঁজুন…",
+      "searching": "খোঁজা হচ্ছে…",
+      "title": "কমান্ড বার"
     }
   },
   "autoImprovement": {
