@@ -65,6 +65,7 @@ const mocks = vi.hoisted(() => ({
   sessions: vi.fn(),
   sessionsSearch: vi.fn(),
   createTagColumn: vi.fn(),
+  deleteTagColumn: vi.fn(),
   updateChatFolder: vi.fn(),
   chatFolders: vi.fn(),
   chatTags: vi.fn(),
@@ -199,6 +200,7 @@ beforeEach(() => {
   mocks.sessions.mockResolvedValue({ sessions: [], has_more: false })
   mocks.sessionsSearch.mockResolvedValue({ sessions: [] })
   mocks.createTagColumn.mockResolvedValue({ id: 'col-new' })
+  mocks.deleteTagColumn.mockResolvedValue({ ok: true })
   mocks.updateChatFolder.mockResolvedValue({ ok: true })
   mocks.chatFolders.mockResolvedValue([])
   mocks.chatTags.mockResolvedValue([])
@@ -337,12 +339,36 @@ describe('ChatSidebar — Switch All Sessions panel', () => {
 })
 
 describe('ChatSidebar — header menu view + tag entries', () => {
-  it('turning on board view seeds a first column', async () => {
+  it('turning on board view seeds the four state lanes', async () => {
+    // An empty board is seeded with the derived state lanes rather than one
+    // unnamed match-all column, which renders as a single "All sessions" pile.
     renderSidebar({ slots: [{ key: 'k-a', title: 'A', running: false }] })
     openHeaderMenu()
     fireEvent.click(await screen.findByText('Switch to board view'))
     expect(cfg.saveChatConfig).toHaveBeenCalledWith(expect.objectContaining({ tagColumnsEnabled: true }))
-    await waitFor(() => expect(mocks.createTagColumn).toHaveBeenCalledWith({ name: '', tag_ids: [], mode: 'any' }))
+    await waitFor(() => expect(mocks.createTagColumn).toHaveBeenCalledTimes(4))
+    expect(mocks.createTagColumn.mock.calls.map(c => c[0].state_key))
+      .toEqual(['needs_approval', 'waiting', 'working', 'idle'])
+    expect(mocks.createTagColumn).toHaveBeenCalledWith(
+      expect.objectContaining({ source: 'state', state_key: 'working' }),
+    )
+  })
+
+  it('adding lanes to a configured board deletes none of its columns', async () => {
+    // "Add column after" creates the same unnamed/unfiltered shape the view
+    // toggle's placeholder has, so a bare column beside configured ones may be a
+    // deliberate All Sessions lane. Deleting it would destroy persisted board
+    // configuration, so placeholders are cleared only when that is ALL there is.
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    mocks.tagColumns.mockResolvedValue([
+      { id: 'c-named', name: 'Jira', tag_ids: [], mode: 'any', order: 0 },
+      { id: 'c-bare', name: '', tag_ids: [], mode: 'any', order: 1 },
+    ])
+    renderSidebar({ slots: [{ key: 'k-a', title: 'A', running: false }] })
+    openHeaderMenu()
+    fireEvent.click(await screen.findByTestId('add-state-lanes'))
+    await waitFor(() => expect(mocks.createTagColumn).toHaveBeenCalledTimes(4))
+    expect(mocks.deleteTagColumn).not.toHaveBeenCalled()
   })
 
   it('offers the way back to list view once board view is on', async () => {

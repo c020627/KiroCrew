@@ -2,9 +2,12 @@
 
 Tags are user-defined labels (id/name/color/status) attached to dashboard chat
 slots. Sessions can carry multiple tags. The sidebar renders as a horizontal
-strip of user-configurable columns; each column filters the session list by a
-set of tags (any/all/none mode). Dragging a session card between columns that
-carry a single status tag as filter reassigns the card's status tag.
+strip of user-configurable columns. A column filters either by a set of tags
+(any/all/none mode) or by the session's live runtime lane — needs-approval,
+waiting, working, idle — which is derived from the slot payload rather than
+stored on the session. Dragging a session card between columns that carry a
+single status tag as filter reassigns the card's status tag; a derived state
+lane refuses the drop, because only the agent's own progress moves a card there.
 """
 
 from __future__ import annotations
@@ -29,6 +32,17 @@ _NAME_MAX = 60
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 _DEFAULT_COLOR = "#6b7280"
 _VALID_MODES = {"any", "all", "none"}
+
+# A column filters either by tag ("tags", the default) or by the session's live
+# runtime state ("state"). A state column names one lane in _VALID_STATE_KEYS;
+# membership is derived from the slot payload on every push, so a card moves
+# between state lanes on its own and no tag is ever written for it.
+_VALID_SOURCES = {"tags", "state"}
+
+# The lane vocabulary. Kept server-side so an unknown key cannot reach the board
+# and render an eternally-empty column: the lanes are exhaustive and mutually
+# exclusive by construction, and a card that matched nothing would vanish.
+_VALID_STATE_KEYS = {"needs_approval", "waiting", "working", "idle"}
 
 _T = TypeVar("_T")
 
@@ -433,6 +447,11 @@ def _normalize_column(
     client presents as "the filter does nothing" with no signal anywhere.
     An empty list stays valid: it is the documented match-all/clear-filter
     state the board UI depends on.
+
+    ``source`` discriminates the two column kinds. ``"tags"`` (the default, and
+    what every column persisted without the field is read as) filters by
+    ``tag_ids``/``mode``. ``"state"`` filters by the session's live runtime lane
+    named in ``state_key`` and ignores the tag fields entirely.
     """
     if not isinstance(raw, dict):
         return None
@@ -461,11 +480,30 @@ def _normalize_column(
                 pass
     if "include_untagged" in raw:
         cleaned["include_untagged"] = bool(raw.get("include_untagged"))
+    if "source" in raw:
+        source = str(raw.get("source") or "tags")
+        if source not in _VALID_SOURCES:
+            return None
+        cleaned["source"] = source
+    if "state_key" in raw:
+        state_key = str(raw.get("state_key") or "")
+        if state_key and state_key not in _VALID_STATE_KEYS:
+            return None
+        cleaned["state_key"] = state_key
     cleaned.setdefault("mode", "any")
     cleaned.setdefault("tag_ids", [])
     cleaned.setdefault("name", "")
     cleaned.setdefault("order", 0)
     cleaned.setdefault("include_untagged", False)
+    cleaned.setdefault("source", "tags")
+    cleaned.setdefault("state_key", "")
+    # A state column without a lane key would match nothing, and a tag column
+    # carrying one would claim a lane it does not filter by. Refuse both rather
+    # than coercing: a silently-corrected column reads as a broken filter.
+    if cleaned["source"] == "state" and not cleaned["state_key"]:
+        return None
+    if cleaned["source"] == "tags" and cleaned["state_key"]:
+        return None
     return cleaned
 
 
@@ -643,7 +681,9 @@ async def api_chat_slot_drop(request: web.Request) -> web.Response:
     Destination rule: if the target column's tag_ids contains exactly one
     *status* tag, strip every status tag from the slot and add that one.
     Non-status tags are preserved. Any other configuration is a no-op so users
-    can have filter-only columns without accidental data loss.
+    can have filter-only columns without accidental data loss. A derived state
+    lane is refused outright — its membership follows the session's runtime
+    state and no tag write can place a card there.
     """
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
@@ -661,6 +701,22 @@ async def api_chat_slot_drop(request: web.Request) -> web.Response:
             {"error": "column not found", "code": "column_not_found"}, status=404
         )
     tag_index = {t["id"]: t for t in state._tags}
+    if column.get("source") == "state":
+        # A state lane's membership is derived from the session's own runtime
+        # state, so there is nothing to write that would move the card there —
+        # only the agent reaching that state moves it. Refuse rather than
+        # silently reassigning tags the lane does not filter by.
+        sel().log_api_access(
+            caller="dashboard",
+            operation="chat.slot_drop",
+            outcome="rejected",
+            source="dashboard",
+            resources=f"{name}->{column_id}",
+            error="column is a derived state lane",
+        )
+        return web.json_response(
+            {"ok": False, "reason": "column is a derived state lane", "tags": slot.tags}
+        )
     col_tags = [tag_index[t] for t in column.get("tag_ids") or [] if t in tag_index]
     status_tags = [t for t in col_tags if t.get("status")]
     if len(status_tags) != 1:

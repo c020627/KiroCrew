@@ -1,0 +1,124 @@
+import { describe, it, expect } from 'vitest'
+import { SESSION_LANES, inferLane, type LaneSlotFields } from '../pages/chat/sessionLane'
+
+/** The two properties the board depends on, asserted directly rather than
+ *  inferred from the rule list: a card that matches no lane vanishes, and a card
+ *  that matches two is rendered twice and double-counted. */
+describe('inferLane exhaustiveness and exclusivity', () => {
+  const FIELDS: (keyof LaneSlotFields)[] = [
+    'pending_approval', 'needs_input', 'has_options', 'interrupted',
+    'running', 'orchestrating', 'subagents_running',
+  ]
+
+  it('assigns every combination of state flags to exactly one known lane', () => {
+    const keys = SESSION_LANES.map(l => l.key)
+    // 2^7 flag combinations × sub-agent-approval present/absent.
+    for (let mask = 0; mask < 1 << FIELDS.length; mask++) {
+      for (const subagentAwaiting of [0, 2]) {
+        const slot: LaneSlotFields = {}
+        FIELDS.forEach((f, i) => { if (mask & (1 << i)) slot[f] = true })
+        const lane = inferLane(slot, { subagentAwaiting })
+        expect(keys, `mask ${mask}`).toContain(lane)
+        expect(keys.filter(k => k === lane)).toHaveLength(1)
+      }
+    }
+  })
+
+  it('files a session with no state at all under idle, never nowhere', () => {
+    expect(inferLane({})).toBe('idle')
+  })
+})
+
+describe('inferLane precedence', () => {
+  it('ranks an owed approval above a running turn', () => {
+    // A blocking approval leaves `running` true. Ranking working first would
+    // render the row as a spinner and bury the decision the board exists for.
+    expect(inferLane({ pending_approval: true, running: true })).toBe('needs_approval')
+  })
+
+  it('ranks a sub-agent approval above the parent looking idle', () => {
+    // The parent is not running anything, so without the extras it would sort
+    // to idle — the least urgent lane — while a click is owed.
+    expect(inferLane({}, { subagentAwaiting: 1 })).toBe('needs_approval')
+  })
+
+  it('ignores a zero sub-agent approval count', () => {
+    expect(inferLane({ running: true }, { subagentAwaiting: 0 })).toBe('working')
+  })
+
+  it('ranks an unanswered question above a running turn', () => {
+    expect(inferLane({ needs_input: true, running: true })).toBe('waiting')
+  })
+
+  it('treats an options card as waiting on the user', () => {
+    expect(inferLane({ has_options: true })).toBe('waiting')
+  })
+
+  it('treats an interrupted turn as waiting, not idle', () => {
+    // The session sits dead until the user resumes it; idle would imply nothing
+    // is owed.
+    expect(inferLane({ interrupted: true })).toBe('waiting')
+  })
+
+  it('ranks an approval above a question', () => {
+    expect(inferLane({ pending_approval: true, needs_input: true })).toBe('needs_approval')
+  })
+})
+
+describe('inferLane working signals', () => {
+  it('counts a plain running turn', () => {
+    expect(inferLane({ running: true })).toBe('working')
+  })
+
+  it('counts autopilot stage execution', () => {
+    expect(inferLane({ orchestrating: true })).toBe('working')
+  })
+
+  it('counts sub-agents running under an idle parent', () => {
+    expect(inferLane({ subagents_running: true })).toBe('working')
+  })
+
+  it('counts a queued prompt behind a finished turn', () => {
+    expect(inferLane({ queue_depth: 1 })).toBe('working')
+  })
+
+  it('counts an armed monitor loop between cycles', () => {
+    // The loop wakes the session on its own, so it is working rather than idle
+    // even in the gap where no turn is in flight.
+    expect(inferLane({}, { backgroundWork: true })).toBe('working')
+  })
+
+  it('counts a dynamic workflow running against an otherwise-idle slot', () => {
+    // A workflow is tracked in the store, not on the slot payload, so `running`
+    // is false while it executes. Without it the board files the session as Idle
+    // while its own row renders a workflow spinner.
+    expect(inferLane({ running: false }, { backgroundWork: true })).toBe('working')
+  })
+
+  it('does not treat absent background work as work', () => {
+    expect(inferLane({}, { backgroundWork: false })).toBe('idle')
+  })
+
+  it('does not treat a zero queue depth as work', () => {
+    expect(inferLane({ queue_depth: 0 })).toBe('idle')
+  })
+})
+
+describe('SESSION_LANES', () => {
+  it('orders the lanes most-urgent first', () => {
+    expect(SESSION_LANES.map(l => l.key)).toEqual(['needs_approval', 'waiting', 'working', 'idle'])
+  })
+
+  it('ends on idle so the fallback lane is the rightmost column', () => {
+    expect(SESSION_LANES[SESSION_LANES.length - 1].key).toBe('idle')
+  })
+
+  it('gives every lane a distinct key and a label key', () => {
+    const keys = SESSION_LANES.map(l => l.key)
+    expect(new Set(keys).size).toBe(keys.length)
+    for (const lane of SESSION_LANES) {
+      expect(lane.labelKey).toMatch(/^pages\.chatSidebar\.lane_/)
+      expect(lane.color).toMatch(/^var\(--/)
+    }
+  })
+})
