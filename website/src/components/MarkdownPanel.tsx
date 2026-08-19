@@ -217,6 +217,7 @@ interface Props {
 
 import { PierreFilePair, type PierreEditorHandle, type RevealTarget } from '../pierre'
 import { i18nT } from '../i18n/t'
+import FilePathMenu from './FilePathMenu'
 
 /**
  * File types that render through a dedicated viewer instead of a text editor.
@@ -281,8 +282,7 @@ async function downloadFile(filePath: string) {
  */
 async function revealOrOpen(filePath: string, action: 'open' | 'reveal') {
   try {
-    const res = await api.revealPath(filePath, action)
-    if (res?.copy) alert(i18nT('components.markdownPanel.path_copied_to_clipboard_no_desktop_available'))
+    await api.revealPath(filePath, action)
   } catch (err) {
     // eslint-disable-next-line no-console -- surface reveal failures for diagnostics
     console.error('revealPath failed', err)
@@ -1603,6 +1603,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
         <div className="shrink-0 border-b border-border">
           <div className="flex items-center gap-2 h-[38px] px-3">
             <FileText size={14} className="text-muted shrink-0" />
+            <FilePathMenu filePath={filePath}>
             <span className="flex items-center min-w-0" title={filePath}>
               {crumbs.map((c, i) => (
                 <span key={i} className="flex items-center min-w-0 text-[12px]">
@@ -1611,6 +1612,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
                 </span>
               ))}
             </span>
+            </FilePathMenu>
             {diffMode && (diffStats.added > 0 || diffStats.removed > 0) && (
               <span className="text-[11px] font-mono font-semibold shrink-0">
                 {diffStats.added > 0 && <span className="text-ok">+{diffStats.added}</span>}

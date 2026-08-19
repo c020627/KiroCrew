@@ -31,14 +31,13 @@ interface FileViewerProps {
  *
  * A headless host has no file manager, and the backend says so by answering
  * with `copy` rather than an error — `api.revealPath` puts the path on the
- * clipboard in that case, so the alert tells the user why nothing appeared on
- * screen instead of leaving the click looking broken. A refusal (the SEL guard
- * treats the path as sensitive) surfaces the server's own message.
+ * clipboard and shows the copy confirmation itself in that case, so nothing
+ * further is needed here. A refusal (the SEL guard treats the path as
+ * sensitive) surfaces the server's own message.
  */
 async function revealFile(filePath: string) {
   try {
-    const res = await api.revealPath(filePath)
-    if (res?.copy) alert(i18nT('apps.fileExplorer.fileViewer.path_copied_to_clipboard_no_desktop_available'))
+    await api.revealPath(filePath)
   } catch (err) {
     // eslint-disable-next-line no-console -- surface reveal failures for diagnostics
     console.error('revealPath failed', err)

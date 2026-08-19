@@ -4600,6 +4600,12 @@
       "verdict_tap_noop": "That’s a quick tap — in “{{mode}}” mode nothing would happen. Hold the key longer.",
       "verdict_toggle": "Recognised — in a real chat this press would start recording, and the next press would stop it.",
       "verdict_wrong_key": "That was {{got}}, not the {{want}} you chose above. If your keyboard has no such key, pick a different one under “{{field}}”."
+    },
+    "filePathMenu": {
+      "open_with_default_app": "Open with default app",
+      "show_in_file_manager": "Show in file manager",
+      "copy_path": "Copy path",
+      "reveal_failed": "Could not open the file. Check the path and try again."
     }
   },
   "hooks": {

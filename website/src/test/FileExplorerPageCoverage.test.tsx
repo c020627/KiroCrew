@@ -371,16 +371,19 @@ describe('FileExplorerPage reveal', () => {
     expect(reveal).toHaveBeenCalledExactlyOnceWith('/home/user/notes.txt')
   })
 
-  it('explains the clipboard fallback when the host has no desktop', async () => {
-    // `api.revealPath` has already copied the path by the time it answers with
-    // `copy`; without the notice the click would look like it did nothing.
-    spyReveal({ ok: true, copy: '/home/user/notes.txt' })
+  it('does not alert locally when the mocked backend resolves with a copy fallback', async () => {
+    // The copy-fallback confirmation is centralized in api.revealPath itself
+    // (client.ts), right next to its copyToClipboard call, so this call site
+    // must not also alert — that would double-notify once the real client
+    // resolves.
+    const reveal = spyReveal({ ok: true, copy: '/home/user/notes.txt' })
     const alerted = captureAlert()
     renderPage()
     await ready()
     await openFromTree('notes.txt')
     await pickFromOverflow('Show in file manager')
-    await waitFor(() => expect(alerted).toHaveBeenCalledWith('Path copied to clipboard (no desktop available)'))
+    await waitFor(() => expect(reveal).toHaveBeenCalled())
+    expect(alerted).not.toHaveBeenCalled()
   })
 
   it("surfaces a refusal with the server's own message", async () => {

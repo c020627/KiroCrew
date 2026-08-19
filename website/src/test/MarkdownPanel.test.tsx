@@ -130,13 +130,17 @@ describe('MarkdownPanel OverflowMenu', () => {
     expect(screen.queryByText('Open in File Explorer')).not.toBeInTheDocument()
   })
 
-  it('tells the user the path was copied when the host has no desktop', async () => {
+  // The copy-fallback confirmation is centralized in api.revealPath itself
+  // (client.ts), right next to its copyToClipboard call, so every call site —
+  // including this panel — is covered without a local alert. Asserting no
+  // local alert here guards against double-notifying once the panel resolves
+  // through the (mocked) real client.
+  it('does not alert locally when the mocked backend resolves with a copy fallback', async () => {
     vi.mocked(api).revealPath = vi.fn().mockResolvedValue({ ok: true, copy: '/tmp/hello.txt' })
     openMenu()
     fireEvent.click(screen.getByText('Show in file manager'))
-    await waitFor(() => expect(window.alert).toHaveBeenCalledWith(
-      'Path copied to clipboard (no desktop available)',
-    ))
+    await waitFor(() => expect(api.revealPath).toHaveBeenCalled())
+    expect(window.alert).not.toHaveBeenCalled()
   })
 
   it('surfaces the server message when the reveal is refused', async () => {
